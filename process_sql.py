@@ -25,8 +25,9 @@
 ################################
 
 import json
-import sqlite3
 from nltk import word_tokenize
+from sqlalchemy.ext.automap import automap_base
+from sqlalchemy import create_engine
 
 CLAUSE_KEYWORDS = ('select', 'from', 'where', 'group', 'order', 'limit', 'intersect', 'union', 'except')
 JOIN_KEYWORDS = ('join', 'on', 'as')
@@ -44,73 +45,56 @@ SQL_OPS = ('intersect', 'union', 'except')
 ORDER_OPS = ('desc', 'asc')
 
 
+def get_schema(db):
+    base = automap_base()
+
+    # engine
+    engine = create_engine(f'sqlite:///{db}')
+
+    # reflect the tables
+    base.prepare(autoload_with=engine)
+    return base
+
 
 class Schema:
     """
     Simple schema which maps table&column to a unique identifier
     """
+
     def __init__(self, schema):
         self._schema = schema
-        self._idMap = self._map(self._schema)
+        self._id_map = self._map(self._schema)
 
     @property
     def schema(self):
         return self._schema
 
     @property
-    def idMap(self):
-        return self._idMap
+    def id_map(self):
+        return self._id_map
+
+    @property
+    def tables(self) -> list[str]:
+        return [table.__table__.name.lower() for table in self._schema.classes]
+
+    @property
+    def columns(self) -> dict[str, list[str]]:
+        columns = {}
+        for table in self._schema.classes:
+            columns[table.__table__.name.lower()] = [col.name.lower() for col in table.__table__.columns]
+        return columns
+
 
     def _map(self, schema):
-        idMap = {'*': "__all__"}
-        id = 1
-        for key, vals in schema.items():
-            for val in vals:
-                idMap[key.lower() + "." + val.lower()] = "__" + key.lower() + "." + val.lower() + "__"
-                id += 1
+        id_map = {'*': "__all__"}
+        idx = 1
+        for relation in schema.classes:
+            for col in relation.__table__.columns:
+                id_map[relation.__table__.name.lower() + "." + col.name.lower()] = "__" + relation.__table__.name.lower() + "." + col.name.lower() + "__"
+                idx += 1
+            id_map[relation.__table__.name.lower()] = "__" + relation.__table__.name.lower() + "__"
 
-        for key in schema:
-            idMap[key.lower()] = "__" + key.lower() + "__"
-            id += 1
-
-        return idMap
-
-
-def get_schema(db):
-    """
-    Get database's schema, which is a dict with table name as key
-    and list of column names as value
-    :param db: database path
-    :return: schema dict
-    """
-
-    schema = {}
-    conn = sqlite3.connect(db)
-    cursor = conn.cursor()
-
-    # fetch table names
-    cursor.execute("SELECT name FROM sqlite_master WHERE type='table';")
-    tables = [str(table[0].lower()) for table in cursor.fetchall()]
-
-    # fetch table info
-    for table in tables:
-        cursor.execute("PRAGMA table_info({})".format(table))
-        schema[table] = [str(col[1].lower()) for col in cursor.fetchall()]
-
-    return schema
-
-
-def get_schema_from_json(fpath):
-    with open(fpath) as f:
-        data = json.load(f)
-
-    schema = {}
-    for entry in data:
-        table = str(entry['table'].lower())
-        cols = [str(col['column_name'].lower()) for col in entry['col_data']]
-        schema[table] = cols
-
-    return schema
+        return id_map
 
 
 def tokenize(string):
@@ -158,7 +142,7 @@ def scan_alias(toks):
 
 def get_tables_with_alias(schema, toks):
     tables = scan_alias(toks)
-    for key in schema:
+    for key in schema.tables:
         assert key not in tables, "Alias {} has the same name in table".format(key)
         tables[key] = key
     return tables
@@ -170,20 +154,20 @@ def parse_col(toks, start_idx, tables_with_alias, schema, default_tables=None):
     """
     tok = toks[start_idx]
     if tok == "*":
-        return start_idx + 1, schema.idMap[tok]
+        return start_idx + 1, schema.id_map[tok]
 
     if '.' in tok:  # if token is a composite
         alias, col = tok.split('.')
         key = tables_with_alias[alias] + "." + col
-        return start_idx+1, schema.idMap[key]
+        return start_idx + 1, schema.id_map[key]
 
     assert default_tables is not None and len(default_tables) > 0, "Default tables should not be None or empty"
 
     for alias in default_tables:
         table = tables_with_alias[alias]
-        if tok in schema.schema[table]:
+        if tok in schema.columns[table]:
             key = table + "." + tok
-            return start_idx+1, schema.idMap[key]
+            return start_idx + 1, schema.id_map[key]
 
     assert False, "Error col: {}".format(tok)
 
@@ -264,7 +248,7 @@ def parse_table_unit(toks, start_idx, tables_with_alias, schema):
     else:
         idx += 1
 
-    return idx, schema.idMap[key], key
+    return idx, schema.id_map[key], key
 
 
 def parse_value(toks, start_idx, tables_with_alias, schema, default_tables=None):
@@ -553,7 +537,7 @@ def load_data(fpath):
 
 def get_sql(schema, query):
     toks = tokenize(query)
-    tables_with_alias = get_tables_with_alias(schema.schema, toks)
+    tables_with_alias = get_tables_with_alias(schema, toks)
     _, sql = parse_sql(toks, 0, tables_with_alias, schema)
 
     return sql

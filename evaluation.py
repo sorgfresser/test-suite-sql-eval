@@ -755,7 +755,7 @@ def build_valid_col_units(table_units, schema):
     col_ids = [table_unit[1] for table_unit in table_units if table_unit[0] == TABLE_TYPE['table_unit']]
     prefixs = [col_id[:-2] for col_id in col_ids]
     valid_col_units= []
-    for value in schema.idMap.values():
+    for value in schema.id_map.values():
         if '.' in value and value[:value.index('.')] in prefixs:
             valid_col_units.append(value)
     return valid_col_units
@@ -868,7 +868,7 @@ def build_foreign_key_map(entry):
     cols_orig = entry["column_names_original"]
     tables_orig = entry["table_names_original"]
 
-    # rebuild cols corresponding to idmap in Schema
+    # rebuild cols corresponding to id_map in Schema
     cols = []
     for col_orig in cols_orig:
         if col_orig[0] >= 0:
