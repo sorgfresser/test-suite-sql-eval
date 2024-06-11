@@ -142,3 +142,14 @@ The process through which data are transformed can be seen in classical_provenan
 }
 ```
 
+## Reproducibility
+
+We yield different results on two examples for the nested query count on the dev gold file, namely lines 745 and 746,
+where we report a nesting count of 1 while the paper reports a nesting count of 0. 
+Since fixing this would require introducing a bug present in the original implementation,
+we decided to keep the original implementation.
+Apart from that, we tried to align to the original implementation as closely as possible.
+This led to a few rather questionable implementation decisions
+- We only count subqueries, not sub-subqueries for the nested query count to align with the original implementation
+- In case of an outer intersect, union or except we only measure the complexity of the individual components of the first query, not the complexity of the whole query
+- We only check outer SQL for the component complexity, not subqueries

@@ -24,14 +24,17 @@ import json
 import sqlite3
 import argparse
 
-from process_sql import get_schema, Schema, get_sql
+from process_sql_new import get_schema, Schema, get_sql
 from exec_eval import eval_exec_match
+from sqlglot.expressions import Intersect, Except, Union, Subquery, Expression, Count, Max, Min, Sum, Avg, Column, \
+    Condition
 
 # Flag to disable value evaluation
 DISABLE_VALUE = True
 # Flag to disable distinct in select evaluation
 DISABLE_DISTINCT = True
 
+AGG_EXPRESSIONS = (Count, Max, Min, Sum, Avg)
 
 CLAUSE_KEYWORDS = ('select', 'from', 'where', 'group', 'order', 'limit', 'intersect', 'union', 'except')
 JOIN_KEYWORDS = ('join', 'on', 'as')
@@ -47,7 +50,6 @@ TABLE_TYPE = {
 COND_OPS = ('and', 'or')
 SQL_OPS = ('intersect', 'union', 'except')
 ORDER_OPS = ('desc', 'asc')
-
 
 HARDNESS = {
     "component1": ('where', 'group', 'order', 'limit', 'join', 'or', 'like'),
@@ -101,10 +103,10 @@ def F1(acc, rec):
 
 def get_scores(count, pred_total, label_total):
     if pred_total != label_total:
-        return 0,0,0
+        return 0, 0, 0
     elif count == pred_total:
-        return 1,1,1
-    return 0,0,0
+        return 1, 1, 1
+    return 0, 0, 0
 
 
 def eval_sel(pred, label):
@@ -186,7 +188,8 @@ def eval_order(pred, label):
     if len(label['orderBy']) > 0:
         label_total = 1
     if len(label['orderBy']) > 0 and pred['orderBy'] == label['orderBy'] and \
-            ((pred['limit'] is None and label['limit'] is None) or (pred['limit'] is not None and label['limit'] is not None)):
+            ((pred['limit'] is None and label['limit'] is None) or (
+                    pred['limit'] is not None and label['limit'] is not None)):
         cnt = 1
     return label_total, pred_total, cnt
 
@@ -198,8 +201,8 @@ def eval_and_or(pred, label):
     label_ao = set(label_ao)
 
     if pred_ao == label_ao:
-        return 1,1,1
-    return len(pred_ao),len(label_ao),0
+        return 1, 1, 1
+    return len(pred_ao), len(label_ao), 0
 
 
 def get_nestedSQL(sql):
@@ -320,9 +323,104 @@ def count_component1(sql):
     return count
 
 
+def count_component1(sql):
+    count = 0
+    # Outermost intersect / union / except or plain select
+    # The original implementation takes only the left query into account in this case (for god knows what reason)
+    if isinstance(sql, Intersect) or isinstance(sql, Except) or isinstance(sql, Union):
+        select = sql.left
+    else:
+        select = sql
+    # Only check outer components, not nested SQL (similar to original implementation)
+
+    if select.args.get("where") is not None:
+        count += 1
+    if select.args.get("group") is not None:
+        count += 1
+    if select.args.get("order") is not None:
+        count += 1
+    if select.args.get("limit") is not None:
+        count += 1
+    # One per join in outer components, similar to original implementation
+    if select.args.get("joins") is not None:
+        count += len(select.args.get("joins"))
+    # Add or count. From is not needed as there can only be "and" in from conditions in original implementation
+    or_count = 0
+    if select.args.get("where"):
+        or_count += str(select.args.get("where")).count(" OR ")
+    if select.args.get("having"):
+        or_count += str(select.args.get("having")).count(" OR ")
+    count += or_count
+    # Add like count. From is not needed as there can only be "and" in from conditions in original implementation
+    like_count = 0
+    if select.args.get("where"):
+        like_count += str(select.args.get("where")).count(" LIKE ")
+    if select.args.get("having"):
+        like_count += str(select.args.get("having")).count(" LIKE ")
+    count += like_count
+    return count
+
+
 def count_component2(sql):
     nested = get_nestedSQL(sql)
     return len(nested)
+
+
+def subquery_count(expression: Expression):
+    def stop_traversing(expression):
+        # Stop traversing on Subqueries as sub-subqueries are not counted in the original implementation
+        return expression is None or expression.is_leaf() or isinstance(expression, Subquery)
+
+    count = 0
+    for node in expression.walk(
+            bfs=False, prune=stop_traversing
+    ):
+        if isinstance(node, Subquery):
+            count += 1
+
+    return count
+
+
+def count_component2(sql):
+    nested_count = 0
+    # Outermost intersect / union / except or plain select
+    # The original implementation takes only the left query into account in this case (for god knows what reason)
+    if isinstance(sql, Intersect) or isinstance(sql, Except) or isinstance(sql, Union):
+        nested_count += 1
+        select = sql.left
+    else:
+        select = sql
+    if select.args.get("from"):
+        from_clause = select.args.get("from")
+        nested_count += subquery_count(from_clause)
+    if select.args.get("joins"):
+        join_clause = select.args.get("joins")
+        for join in join_clause:
+            nested_count += subquery_count(join)
+    if select.args.get("where"):
+        where_clause = select.args.get("where")
+        nested_count += subquery_count(where_clause)
+    if select.args.get("having"):
+        having_clause = select.args.get("having")
+        nested_count += subquery_count(having_clause)
+    return nested_count
+
+
+
+
+def count_agg(expression: Expression):
+    def stop_traversing(expression):
+        # Stop traversing on Subqueries as sub-subqueries are not counted in the original implementation
+        return expression is None or expression.is_leaf() or isinstance(expression, Subquery)
+
+    count = 0
+    for node in expression.walk(
+            bfs=False, prune=stop_traversing
+    ):
+        if any(isinstance(node, agg) for agg in AGG_EXPRESSIONS):
+            count += 1
+
+    return count
 
 
 def count_others(sql):
@@ -333,7 +431,7 @@ def count_others(sql):
     agg_count += count_agg(sql['groupBy'])
     if len(sql['orderBy']) > 0:
         agg_count += count_agg([unit[1] for unit in sql['orderBy'][1] if unit[1]] +
-                            [unit[2] for unit in sql['orderBy'][1] if unit[2]])
+                               [unit[2] for unit in sql['orderBy'][1] if unit[2]])
     agg_count += count_agg(sql['having'])
     if agg_count > 1:
         count += 1
@@ -353,8 +451,72 @@ def count_others(sql):
     return count
 
 
+def count_columns(expression: Expression):
+    def stop_traversing(expression):
+        # Stop traversing on Subqueries as sub-subqueries are not counted in the original implementation
+        return expression is None or expression.is_leaf() or isinstance(expression, Subquery)
+
+    count = 0
+    for node in expression.walk(
+            bfs=False, prune=stop_traversing
+    ):
+        if isinstance(node, Column):
+            count += 1
+
+    return count
+
+
+def count_conditions(expression: Expression):
+    def stop_traversing(expression):
+        # Stop traversing on Subqueries as sub-subqueries are not counted in the original implementation
+        return expression is None or expression.is_leaf() or isinstance(expression, Subquery) or isinstance(expression,
+                                                                                                            Condition)
+
+    count = 0
+    for node in expression.walk(
+            bfs=False, prune=stop_traversing
+    ):
+        if isinstance(node, Condition):
+            count += 1
+
+    return count
+
+
+def count_others(sql):
+    count = 0
+    # only take left query into account for intersect, except, union
+    if isinstance(sql, Intersect) or isinstance(sql, Except) or isinstance(sql, Union):
+        select = sql.left
+    else:
+        select = sql
+    agg_count = count_agg(select)
+    if select.args.get("where"):
+        agg_count += count_agg(select.args.get("where"))
+    if select.args.get("group"):
+        agg_count += count_agg(select.args.get("group"))
+    if select.args.get("order"):
+        agg_count += count_agg(select.args.get("order"))
+    if select.args.get("having"):
+        agg_count += count_agg(select.args.get("having"))
+    if agg_count > 1:
+        count += 1
+    column_count = len(select.expressions)
+    # for expr in select.expressions:
+    #     column_count += count_columns(expr)
+    if column_count > 1:
+        count += 1
+    if select.args.get("where"):
+        if count_conditions(select.args.get("where")) > 1:
+            count += 1
+    if select.args.get("group"):
+        if len(select.args.get("group").expressions) > 1:
+            count += 1
+    return count
+
+
 class Evaluator:
     """A simple evaluator"""
+
     def __init__(self):
         self.partial_scores = None
 
@@ -394,39 +556,40 @@ class Evaluator:
 
         label_total, pred_total, cnt, cnt_wo_agg = eval_sel(pred, label)
         acc, rec, f1 = get_scores(cnt, pred_total, label_total)
-        res['select'] = {'acc': acc, 'rec': rec, 'f1': f1,'label_total':label_total,'pred_total':pred_total}
+        res['select'] = {'acc': acc, 'rec': rec, 'f1': f1, 'label_total': label_total, 'pred_total': pred_total}
         acc, rec, f1 = get_scores(cnt_wo_agg, pred_total, label_total)
-        res['select(no AGG)'] = {'acc': acc, 'rec': rec, 'f1': f1,'label_total':label_total,'pred_total':pred_total}
+        res['select(no AGG)'] = {'acc': acc, 'rec': rec, 'f1': f1, 'label_total': label_total, 'pred_total': pred_total}
 
         label_total, pred_total, cnt, cnt_wo_agg = eval_where(pred, label)
         acc, rec, f1 = get_scores(cnt, pred_total, label_total)
-        res['where'] = {'acc': acc, 'rec': rec, 'f1': f1,'label_total':label_total,'pred_total':pred_total}
+        res['where'] = {'acc': acc, 'rec': rec, 'f1': f1, 'label_total': label_total, 'pred_total': pred_total}
         acc, rec, f1 = get_scores(cnt_wo_agg, pred_total, label_total)
-        res['where(no OP)'] = {'acc': acc, 'rec': rec, 'f1': f1,'label_total':label_total,'pred_total':pred_total}
+        res['where(no OP)'] = {'acc': acc, 'rec': rec, 'f1': f1, 'label_total': label_total, 'pred_total': pred_total}
 
         label_total, pred_total, cnt = eval_group(pred, label)
         acc, rec, f1 = get_scores(cnt, pred_total, label_total)
-        res['group(no Having)'] = {'acc': acc, 'rec': rec, 'f1': f1,'label_total':label_total,'pred_total':pred_total}
+        res['group(no Having)'] = {'acc': acc, 'rec': rec, 'f1': f1, 'label_total': label_total,
+                                   'pred_total': pred_total}
 
         label_total, pred_total, cnt = eval_having(pred, label)
         acc, rec, f1 = get_scores(cnt, pred_total, label_total)
-        res['group'] = {'acc': acc, 'rec': rec, 'f1': f1,'label_total':label_total,'pred_total':pred_total}
+        res['group'] = {'acc': acc, 'rec': rec, 'f1': f1, 'label_total': label_total, 'pred_total': pred_total}
 
         label_total, pred_total, cnt = eval_order(pred, label)
         acc, rec, f1 = get_scores(cnt, pred_total, label_total)
-        res['order'] = {'acc': acc, 'rec': rec, 'f1': f1,'label_total':label_total,'pred_total':pred_total}
+        res['order'] = {'acc': acc, 'rec': rec, 'f1': f1, 'label_total': label_total, 'pred_total': pred_total}
 
         label_total, pred_total, cnt = eval_and_or(pred, label)
         acc, rec, f1 = get_scores(cnt, pred_total, label_total)
-        res['and/or'] = {'acc': acc, 'rec': rec, 'f1': f1,'label_total':label_total,'pred_total':pred_total}
+        res['and/or'] = {'acc': acc, 'rec': rec, 'f1': f1, 'label_total': label_total, 'pred_total': pred_total}
 
         label_total, pred_total, cnt = eval_IUEN(pred, label)
         acc, rec, f1 = get_scores(cnt, pred_total, label_total)
-        res['IUEN'] = {'acc': acc, 'rec': rec, 'f1': f1,'label_total':label_total,'pred_total':pred_total}
+        res['IUEN'] = {'acc': acc, 'rec': rec, 'f1': f1, 'label_total': label_total, 'pred_total': pred_total}
 
         label_total, pred_total, cnt = eval_keywords(pred, label)
         acc, rec, f1 = get_scores(cnt, pred_total, label_total)
-        res['keywords'] = {'acc': acc, 'rec': rec, 'f1': f1,'label_total':label_total,'pred_total':pred_total}
+        res['keywords'] = {'acc': acc, 'rec': rec, 'f1': f1, 'label_total': label_total, 'pred_total': pred_total}
 
         return res
 
@@ -439,7 +602,6 @@ def isValidSQL(sql, db):
     except:
         return False
     return True
-
 
 
 def print_formated_s(row_name, l, element_format):
@@ -460,25 +622,25 @@ def print_scores(scores, etype, include_turn_acc=True):
     print_formated_s("count", counts, '{:<20d}')
 
     if etype in ["all", "exec"]:
-        print ('=====================   EXECUTION ACCURACY     =====================')
+        print('=====================   EXECUTION ACCURACY     =====================')
         exec_scores = [scores[level]['exec'] for level in levels]
         print_formated_s("execution", exec_scores, '{:<20.3f}')
 
     if etype in ["all", "match"]:
-        print ('\n====================== EXACT MATCHING ACCURACY =====================')
+        print('\n====================== EXACT MATCHING ACCURACY =====================')
         exact_scores = [scores[level]['exact'] for level in levels]
         print_formated_s("exact match", exact_scores, '{:<20.3f}')
-        print ('\n---------------------PARTIAL MATCHING ACCURACY----------------------')
+        print('\n---------------------PARTIAL MATCHING ACCURACY----------------------')
         for type_ in partial_types:
             this_scores = [scores[level]['partial'][type_]['acc'] for level in levels]
             print_formated_s(type_, this_scores, '{:<20.3f}')
 
-        print ('---------------------- PARTIAL MATCHING RECALL ----------------------')
+        print('---------------------- PARTIAL MATCHING RECALL ----------------------')
         for type_ in partial_types:
             this_scores = [scores[level]['partial'][type_]['rec'] for level in levels]
             print_formated_s(type_, this_scores, '{:<20.3f}')
 
-        print ('---------------------- PARTIAL MATCHING F1 --------------------------')
+        print('---------------------- PARTIAL MATCHING F1 --------------------------')
         for type_ in partial_types:
             this_scores = [scores[level]['partial'][type_]['f1'] for level in levels]
             print_formated_s(type_, this_scores, '{:<20.3f}')
@@ -491,18 +653,17 @@ def print_scores(scores, etype, include_turn_acc=True):
         print_formated_s("count", counts, "{:<20d}")
 
         if etype in ["all", "exec"]:
-            print ('=====================   TURN EXECUTION ACCURACY     =====================')
+            print('=====================   TURN EXECUTION ACCURACY     =====================')
             exec_scores = [scores[turn]['exec'] for turn in turns]
             print_formated_s("execution", exec_scores, '{:<20.3f}')
 
         if etype in ["all", "match"]:
-            print ('\n====================== TURN EXACT MATCHING ACCURACY =====================')
+            print('\n====================== TURN EXACT MATCHING ACCURACY =====================')
             exact_scores = [scores[turn]['exact'] for turn in turns]
             print_formated_s("exact match", exact_scores, '{:<20.3f}')
 
 
 def evaluate(gold, predict, db_dir, etype, kmaps, plug_value, keep_distinct, progress_bar_for_each_datapoint):
-
     with open(gold) as f:
         glist = []
         gseq_one = []
@@ -556,7 +717,7 @@ def evaluate(gold, predict, db_dir, etype, kmaps, plug_value, keep_distinct, pro
         scores[level] = {'count': 0, 'partial': {}, 'exact': 0.}
         scores[level]['exec'] = 0
         for type_ in partial_types:
-            scores[level]['partial'][type_] = {'acc': 0., 'rec': 0., 'f1': 0.,'acc_count':0,'rec_count':0}
+            scores[level]['partial'][type_] = {'acc': 0., 'rec': 0., 'f1': 0., 'acc_count': 0, 'rec_count': 0}
 
     for i, (p, g) in enumerate(zip(plist, glist)):
         if (i + 1) % 10 == 0:
@@ -587,27 +748,28 @@ def evaluate(gold, predict, db_dir, etype, kmaps, plug_value, keep_distinct, pro
             except:
                 # If p_sql is not valid, then we will use an empty sql to evaluate with the correct sql
                 p_sql = {
-                "except": None,
-                "from": {
-                    "conds": [],
-                    "table_units": []
-                },
-                "groupBy": [],
-                "having": [],
-                "intersect": None,
-                "limit": None,
-                "orderBy": [],
-                "select": [
-                    False,
-                    []
-                ],
-                "union": None,
-                "where": []
+                    "except": None,
+                    "from": {
+                        "conds": [],
+                        "table_units": []
+                    },
+                    "groupBy": [],
+                    "having": [],
+                    "intersect": None,
+                    "limit": None,
+                    "orderBy": [],
+                    "select": [
+                        False,
+                        []
+                    ],
+                    "union": None,
+                    "where": []
                 }
 
             if etype in ["all", "exec"]:
                 exec_score = eval_exec_match(db=db, p_str=p_str, g_str=g_str, plug_value=plug_value,
-                                             keep_distinct=keep_distinct, progress_bar_for_each_datapoint=progress_bar_for_each_datapoint)
+                                             keep_distinct=keep_distinct,
+                                             progress_bar_for_each_datapoint=progress_bar_for_each_datapoint)
                 if exec_score:
                     scores[hardness]['exec'] += 1
                     scores[turn_id]['exec'] += 1
@@ -700,7 +862,7 @@ def evaluate(gold, predict, db_dir, etype, kmaps, plug_value, keep_distinct, pro
                 else:
                     scores[level]['partial'][type_]['f1'] = \
                         2.0 * scores[level]['partial'][type_]['acc'] * scores[level]['partial'][type_]['rec'] / (
-                        scores[level]['partial'][type_]['rec'] + scores[level]['partial'][type_]['acc'])
+                                scores[level]['partial'][type_]['rec'] + scores[level]['partial'][type_]['acc'])
 
     print_scores(scores, etype, include_turn_acc=include_turn_acc)
     return scores
@@ -754,8 +916,8 @@ def rebuild_sql_val(sql):
 def build_valid_col_units(table_units, schema):
     col_ids = [table_unit[1] for table_unit in table_units if table_unit[0] == TABLE_TYPE['table_unit']]
     prefixs = [col_id[:-2] for col_id in col_ids]
-    valid_col_units= []
-    for value in schema.id_map.values():
+    valid_col_units = []
+    for value in schema.idMap.values():
         if '.' in value and value[:value.index('.')] in prefixs:
             valid_col_units.append(value)
     return valid_col_units
@@ -826,7 +988,8 @@ def rebuild_from_col(valid_col_units, from_, kmap):
     if from_ is None:
         return from_
 
-    from_['table_units'] = [rebuild_table_unit_col(valid_col_units, table_unit, kmap) for table_unit in from_['table_units']]
+    from_['table_units'] = [rebuild_table_unit_col(valid_col_units, table_unit, kmap) for table_unit in
+                            from_['table_units']]
     from_['conds'] = rebuild_condition_col(valid_col_units, from_['conds'], kmap)
     return from_
 
@@ -913,27 +1076,52 @@ def build_foreign_key_map_from_json(table):
     return tables
 
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--gold', dest='gold', type=str, help="the path to the gold queries")
-    parser.add_argument('--pred', dest='pred', type=str, help="the path to the predicted queries")
-    parser.add_argument('--db', dest='db', type=str, help="the directory that contains all the databases and test suites")
-    parser.add_argument('--table', dest='table', type=str, help="the tables.json schema file")
-    parser.add_argument('--etype', dest='etype', type=str, default='exec',
-                        help="evaluation type, exec for test suite accuracy, match for the original exact set match accuracy",
-                        choices=('all', 'exec', 'match'))
-    parser.add_argument('--plug_value', default=False, action='store_true',
-                        help='whether to plug in the gold value into the predicted query; suitable if your model does not predict values.')
-    parser.add_argument('--keep_distinct', default=False, action='store_true',
-                        help='whether to keep distinct keyword during evaluation. default is false.')
-    parser.add_argument('--progress_bar_for_each_datapoint', default=False, action='store_true',
-                        help='whether to print progress bar of running test inputs for each datapoint')
-    args = parser.parse_args()
+# if __name__ == "__main__":
+#     parser = argparse.ArgumentParser()
+#     parser.add_argument('--gold', dest='gold', type=str, help="the path to the gold queries")
+#     parser.add_argument('--pred', dest='pred', type=str, help="the path to the predicted queries")
+#     parser.add_argument('--db', dest='db', type=str,
+#                         help="the directory that contains all the databases and test suites")
+#     parser.add_argument('--table', dest='table', type=str, help="the tables.json schema file")
+#     parser.add_argument('--etype', dest='etype', type=str, default='exec',
+#                         help="evaluation type, exec for test suite accuracy, match for the original exact set match accuracy",
+#                         choices=('all', 'exec', 'match'))
+#     parser.add_argument('--plug_value', default=False, action='store_true',
+#                         help='whether to plug in the gold value into the predicted query; suitable if your model does not predict values.')
+#     parser.add_argument('--keep_distinct', default=False, action='store_true',
+#                         help='whether to keep distinct keyword during evaluation. default is false.')
+#     parser.add_argument('--progress_bar_for_each_datapoint', default=False, action='store_true',
+#                         help='whether to print progress bar of running test inputs for each datapoint')
+#     args = parser.parse_args()
+#
+#     # only evaluting exact match needs this argument
+#     kmaps = None
+#     if args.etype in ['all', 'match']:
+#         assert args.table is not None, 'table argument must be non-None if exact set match is evaluated'
+#         kmaps = build_foreign_key_map_from_json(args.table)
+#
+#     evaluate(args.gold, args.pred, args.db, args.etype, kmaps, args.plug_value, args.keep_distinct,
+#              args.progress_bar_for_each_datapoint)
 
-    # only evaluting exact match needs this argument
-    kmaps = None
-    if args.etype in ['all', 'match']:
-        assert args.table is not None, 'table argument must be non-None if exact set match is evaluated'
-        kmaps = build_foreign_key_map_from_json(args.table)
 
-    evaluate(args.gold, args.pred, args.db, args.etype, kmaps, args.plug_value, args.keep_distinct, args.progress_bar_for_each_datapoint)
+db_dir = "./spider/spider/database"
+with open("/home/simon/PycharmProjects/test-suite-sql-eval/dev_gold.sql", "r") as f:
+    gold = f.readlines()
+gold_tuples = []
+counts = []
+for i in range(len(gold)):
+    gold[i] = gold[i].strip()
+    gold_tuples.append(gold[i].split('\t'))
+idx = 0
+for g, db_name in gold_tuples:
+    if idx == 10:
+        print(idx)
+        print(g)
+    db = os.path.join(db_dir, db_name, db_name + ".sqlite")
+    schema = Schema(get_schema(db))
+    g_sql = get_sql(schema, g)
+    counts.append(count_others(g_sql))
+    idx += 1
+with open("new_countsother.txt", "w") as f:
+    for c in counts:
+        f.write(str(c) + "\n")

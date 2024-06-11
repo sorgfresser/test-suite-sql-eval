@@ -28,6 +28,7 @@ import json
 from nltk import word_tokenize
 from sqlalchemy.ext.automap import automap_base
 from sqlalchemy import create_engine
+import sqlglot
 
 CLAUSE_KEYWORDS = ('select', 'from', 'where', 'group', 'order', 'limit', 'intersect', 'union', 'except')
 JOIN_KEYWORDS = ('join', 'on', 'as')
@@ -84,51 +85,17 @@ class Schema:
             columns[table.__table__.name.lower()] = [col.name.lower() for col in table.__table__.columns]
         return columns
 
-
     def _map(self, schema):
         id_map = {'*': "__all__"}
         idx = 1
         for relation in schema.classes:
             for col in relation.__table__.columns:
-                id_map[relation.__table__.name.lower() + "." + col.name.lower()] = "__" + relation.__table__.name.lower() + "." + col.name.lower() + "__"
+                id_map[
+                    relation.__table__.name.lower() + "." + col.name.lower()] = "__" + relation.__table__.name.lower() + "." + col.name.lower() + "__"
                 idx += 1
             id_map[relation.__table__.name.lower()] = "__" + relation.__table__.name.lower() + "__"
 
         return id_map
-
-
-def tokenize(string):
-    string = str(string)
-    string = string.replace("\'", "\"")  # ensures all string values wrapped by "" problem??
-    quote_idxs = [idx for idx, char in enumerate(string) if char == '"']
-    assert len(quote_idxs) % 2 == 0, "Unexpected quote"
-
-    # keep string value as token
-    vals = {}
-    for i in range(len(quote_idxs)-1, -1, -2):
-        qidx1 = quote_idxs[i-1]
-        qidx2 = quote_idxs[i]
-        val = string[qidx1: qidx2+1]
-        key = "__val_{}_{}__".format(qidx1, qidx2)
-        string = string[:qidx1] + key + string[qidx2+1:]
-        vals[key] = val
-
-    toks = [word.lower() for word in word_tokenize(string)]
-    # replace with string value token
-    for i in range(len(toks)):
-        if toks[i] in vals:
-            toks[i] = vals[toks[i]]
-
-    # find if there exists !=, >=, <=
-    eq_idxs = [idx for idx, tok in enumerate(toks) if tok == "="]
-    eq_idxs.reverse()
-    prefix = ('!', '>', '<')
-    for eq_idx in eq_idxs:
-        pre_tok = toks[eq_idx-1]
-        if pre_tok in prefix:
-            toks = toks[:eq_idx-1] + [pre_tok + "="] + toks[eq_idx+1: ]
-
-    return toks
 
 
 def scan_alias(toks):
@@ -136,7 +103,7 @@ def scan_alias(toks):
     as_idxs = [idx for idx, tok in enumerate(toks) if tok == 'as']
     alias = {}
     for idx in as_idxs:
-        alias[toks[idx+1]] = toks[idx-1]
+        alias[toks[idx + 1]] = toks[idx - 1]
     return alias
 
 
@@ -172,6 +139,21 @@ def parse_col(toks, start_idx, tables_with_alias, schema, default_tables=None):
     assert False, "Error col: {}".format(tok)
 
 
+def is_valid_format_string(s):
+    """
+    Check if the string is a valid format string
+    """
+    if len(s) < 4:
+        return False
+    if not (s[0] == '"' and s[-1] == '"' or s[0] == "'" and s[-1] == "'"):
+        return False
+    # Remove the quotes
+    s = s[1:-1]
+    if s[0] != '%':
+        return False
+    return True
+
+
 def parse_col_unit(toks, start_idx, tables_with_alias, schema, default_tables=None):
     """
         :returns next idx, (agg_op id, col_id)
@@ -196,6 +178,19 @@ def parse_col_unit(toks, start_idx, tables_with_alias, schema, default_tables=No
         assert idx < len_ and toks[idx] == ')'
         idx += 1
         return idx, (agg_id, col_id, isDistinct)
+
+    if toks[idx] == "strftime":
+        idx += 1
+        assert idx < len_ and toks[idx] == '('
+        idx += 1
+        assert (idx < len_ and is_valid_format_string(toks[idx]))
+        idx += 1
+        assert idx < len_ and toks[idx] == ','
+        idx += 1
+        idx, col_id = parse_col(toks, idx, tables_with_alias, schema, default_tables)
+        assert idx < len_ and toks[idx] == ')'
+        idx += 1
+        return idx, (AGG_OPS.index("none"), col_id, False)
 
     if toks[idx] == "distinct":
         idx += 1
@@ -243,7 +238,7 @@ def parse_table_unit(toks, start_idx, tables_with_alias, schema):
     len_ = len(toks)
     key = tables_with_alias[toks[idx]]
 
-    if idx + 1 < len_ and toks[idx+1] == "as":
+    if idx + 1 < len_ and toks[idx + 1] == "as":
         idx += 3
     else:
         idx += 1
@@ -271,9 +266,10 @@ def parse_value(toks, start_idx, tables_with_alias, schema, default_tables=None)
             idx += 1
         except:
             end_idx = idx
-            while end_idx < len_ and toks[end_idx] != ',' and toks[end_idx] != ')'\
-                and toks[end_idx] != 'and' and toks[end_idx] not in CLAUSE_KEYWORDS and toks[end_idx] not in JOIN_KEYWORDS:
-                    end_idx += 1
+            while end_idx < len_ and toks[end_idx] != ',' and toks[end_idx] != ')' \
+                    and toks[end_idx] != 'and' and toks[end_idx] not in CLAUSE_KEYWORDS and toks[
+                end_idx] not in JOIN_KEYWORDS:
+                end_idx += 1
 
             idx, val = parse_col_unit(toks[start_idx: end_idx], 0, tables_with_alias, schema, default_tables)
             idx = end_idx
@@ -347,10 +343,11 @@ def parse_select(toks, start_idx, tables_with_alias, schema, default_tables=None
     return idx, (isDistinct, val_units)
 
 
-def parse_from(toks, start_idx, tables_with_alias, schema):
+def parse_from(expression, schema):
     """
     Assume in the from clause, all table units are combined with join
     """
+    from_clause = expression.args["from"]
     assert 'from' in toks[start_idx:], "'from' not found"
 
     len_ = len(toks)
@@ -372,7 +369,7 @@ def parse_from(toks, start_idx, tables_with_alias, schema):
             if idx < len_ and toks[idx] == 'join':
                 idx += 1  # skip join
             idx, table_unit, table_name = parse_table_unit(toks, idx, tables_with_alias, schema)
-            table_units.append((TABLE_TYPE['table_unit'],table_unit))
+            table_units.append((TABLE_TYPE['table_unit'], table_unit))
             default_tables.append(table_name)
         if idx < len_ and toks[idx] == "on":
             idx += 1  # skip on
@@ -429,7 +426,7 @@ def parse_order_by(toks, start_idx, tables_with_alias, schema, default_tables):
     idx = start_idx
     len_ = len(toks)
     val_units = []
-    order_type = 'asc' # default type is 'asc'
+    order_type = 'asc'  # default type is 'asc'
 
     if idx >= len_ or toks[idx] != 'order':
         return idx, val_units
@@ -471,16 +468,17 @@ def parse_limit(toks, start_idx):
     if idx < len_ and toks[idx] == 'limit':
         idx += 2
         # make limit value can work, cannot assume put 1 as a fake limit number
-        if type(toks[idx-1]) != int:
+        if type(toks[idx - 1]) != int:
             return idx, 1
 
-        return idx, int(toks[idx-1])
+        return idx, int(toks[idx - 1])
 
     return idx, None
 
 
-def parse_sql(toks, start_idx, tables_with_alias, schema):
-    isBlock = False # indicate whether this is a block of sql/sub-sql
+def parse_sql(expression, schema):
+    isBlock = False  # indicate whether this is a block of sql/sub-sql
+    table_units, conds, default_tables = parse_from(expression, schema)
     len_ = len(toks)
     idx = start_idx
 
@@ -535,10 +533,15 @@ def load_data(fpath):
     return data
 
 
+
+
 def get_sql(schema, query):
-    toks = tokenize(query)
-    tables_with_alias = get_tables_with_alias(schema, toks)
-    _, sql = parse_sql(toks, 0, tables_with_alias, schema)
+    parsed = sqlglot.parse(query, dialect='sqlite')
+    assert len(parsed) == 1, "Only support single query"
+    parsed = parsed[0]
+    return parsed
+    # Remove comments and ws
+    _, sql = parse_sql(parsed,  schema)
 
     return sql
 
@@ -548,3 +551,10 @@ def skip_semicolon(toks, start_idx):
     while idx < len(toks) and toks[idx] == ";":
         idx += 1
     return idx
+
+
+if __name__ == '__main__':
+    TEST_SQL = "select distinct prescriptions.route from prescriptions where prescriptions.drug = 'fluconazole' -- and prescriptions.route = 'IV'"
+    schema = Schema(get_schema('mimic_iii.sqlite'))
+    sql = get_sql(schema, TEST_SQL)
+    print(sql)
