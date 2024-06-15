@@ -25,14 +25,12 @@ import sqlite3
 import argparse
 import tqdm
 from process_sql import get_schema, Schema, get_sql
-from process_sql_new import get_schema as get_schema_new
-from process_sql_new import Schema as Schema_new
-from process_sql_new import get_sql as get_sql_new
+
 from exec_eval import eval_exec_match
 from sqlglot.expressions import Intersect, Except, Union, Subquery, Expression, Count, Max, Min, Sum, Avg, Column, \
-    Condition, And, Or, Identifier, Literal, Distinct, Alias, Not, Between, EQ, GT, LT, GTE, LTE, NEQ, In, Like, Is, \
+    Condition, And, Or, Identifier, Literal, Distinct, Not, Between, EQ, GT, LT, GTE, LTE, NEQ, In, Like, Is, \
     Exists, Limit, Order, Having, Group, Where, Ordered, Join, Select
-from sqlglot.optimizer.scope import build_scope, walk_in_scope
+from sqlglot.optimizer.scope import build_scope
 from sqlglot.optimizer.qualify import qualify
 
 # Flag to disable value evaluation
@@ -42,72 +40,10 @@ DISABLE_DISTINCT = True
 
 AGG_EXPRESSIONS = (Count, Max, Min, Sum, Avg)
 
-CLAUSE_KEYWORDS = ('select', 'from', 'where', 'group', 'order', 'limit', 'intersect', 'union', 'except')
-JOIN_KEYWORDS = ('join', 'on', 'as')
-
-WHERE_OPS = ('not', 'between', '=', '>', '<', '>=', '<=', '!=', 'in', 'like', 'is', 'exists')
 WHERE_EXPR = (Not, Between, EQ, GT, LT, GTE, LTE, NEQ, In, Like, Is, Exists)
-UNIT_OPS = ('none', '-', '+', "*", '/')
-AGG_OPS = ('none', 'max', 'min', 'count', 'sum', 'avg')
-TABLE_TYPE = {
-    'sql': "sql",
-    'table_unit': "table_unit",
-}
 
-COND_OPS = ('and', 'or')
 COND_EXPR = (And, Or)
-SQL_OPS = ('intersect', 'union', 'except')
 SQL_EXPR = (Intersect, Union, Except)
-ORDER_OPS = ('desc', 'asc')
-
-HARDNESS = {
-    "component1": ('where', 'group', 'order', 'limit', 'join', 'or', 'like'),
-    "component2": ('except', 'union', 'intersect')
-}
-
-
-def condition_has_or(conds):
-    return 'or' in conds[1::2]
-
-
-def condition_has_like(conds):
-    return WHERE_OPS.index('like') in [cond_unit[1] for cond_unit in conds[::2]]
-
-
-def condition_has_sql(conds):
-    for cond_unit in conds[::2]:
-        val1, val2 = cond_unit[3], cond_unit[4]
-        if val1 is not None and type(val1) is dict:
-            return True
-        if val2 is not None and type(val2) is dict:
-            return True
-    return False
-
-
-def val_has_op(val_unit):
-    return val_unit[0] != UNIT_OPS.index('none')
-
-
-def has_agg(unit):
-    return unit[0] != AGG_OPS.index('none')
-
-
-def accuracy(count, total):
-    if count == total:
-        return 1
-    return 0
-
-
-def recall(count, total):
-    if count == total:
-        return 1
-    return 0
-
-
-def F1(acc, rec):
-    if (acc + rec) == 0:
-        return 0
-    return (2. * acc * rec) / (acc + rec)
 
 
 def get_scores(count, pred_total, label_total):
@@ -130,7 +66,7 @@ def remove_agg(expr):
     return expr
 
 
-def eval_sel_new(pred, label):
+def eval_sel(pred, label):
     """
     Compare select statements of the two (i.e. expressions)
     Also check the same but ignore aggregations this time, i.e. it's okay if aggregations have been forgotten
@@ -154,26 +90,6 @@ def eval_sel_new(pred, label):
         if remove_agg(expr) in expressions_with_agg_removed:
             cnt_wo_agg += 1
             expressions_with_agg_removed.remove(remove_agg(expr))
-    return label_total, pred_total, cnt, cnt_wo_agg
-
-
-def eval_sel(pred, label):
-    pred_sel = pred['select'][1]
-    label_sel = label['select'][1]
-    label_wo_agg = [unit[1] for unit in label_sel]
-    pred_total = len(pred_sel)
-    label_total = len(label_sel)
-    cnt = 0
-    cnt_wo_agg = 0
-
-    for unit in pred_sel:
-        if unit in label_sel:
-            cnt += 1
-            label_sel.remove(unit)
-        if unit[1] in label_wo_agg:
-            cnt_wo_agg += 1
-            label_wo_agg.remove(unit[1])
-
     return label_total, pred_total, cnt, cnt_wo_agg
 
 
@@ -205,7 +121,7 @@ def remove_where_agg(expression: Expression):
     return expression
 
 
-def eval_where_new(pred, label):
+def eval_where(pred, label):
     """
         Compare conditions of the where part of the two (i.e. expressions)
         Also check the same but ignore aggregations this time, i.e. it's okay if aggregations have been forgotten
@@ -240,27 +156,7 @@ def eval_where_new(pred, label):
     return label_total, pred_total, cnt, cnt_wo_agg
 
 
-def eval_where(pred, label):
-    pred_conds = [unit for unit in pred['where'][::2]]
-    label_conds = [unit for unit in label['where'][::2]]
-    label_wo_agg = [unit[2] for unit in label_conds]
-    pred_total = len(pred_conds)
-    label_total = len(label_conds)
-    cnt = 0
-    cnt_wo_agg = 0
-
-    for unit in pred_conds:
-        if unit in label_conds:
-            cnt += 1
-            label_conds.remove(unit)
-        if unit[2] in label_wo_agg:
-            cnt_wo_agg += 1
-            label_wo_agg.remove(unit[2])
-
-    return label_total, pred_total, cnt, cnt_wo_agg
-
-
-def eval_group_new(pred, label):
+def eval_group(pred, label):
     """
     Compare columns of group statement (with stripped table prefix)
     """
@@ -290,22 +186,7 @@ def eval_group_new(pred, label):
     return label_total, pred_total, cnt
 
 
-def eval_group(pred, label):
-    pred_cols = [unit[1] for unit in pred['groupBy']]
-    label_cols = [unit[1] for unit in label['groupBy']]
-    pred_total = len(pred_cols)
-    label_total = len(label_cols)
-    cnt = 0
-    pred_cols = [pred.split(".")[1] if "." in pred else pred for pred in pred_cols]
-    label_cols = [label.split(".")[1] if "." in label else label for label in label_cols]
-    for col in pred_cols:
-        if col in label_cols:
-            cnt += 1
-            label_cols.remove(col)
-    return label_total, pred_total, cnt
-
-
-def eval_having_new(pred, label):
+def eval_having(pred, label):
     """
     Uses the group by columns. Only if group by is equal (including order, unlike whats done in the eval_group)
     and the having sections are IDENTICAL (other than the removed values before), return 1
@@ -326,24 +207,7 @@ def eval_having_new(pred, label):
     return label_total, pred_total, cnt
 
 
-def eval_having(pred, label):
-    pred_total = label_total = cnt = 0
-    if len(pred['groupBy']) > 0:
-        pred_total = 1
-    if len(label['groupBy']) > 0:
-        label_total = 1
-
-    pred_cols = [unit[1] for unit in pred['groupBy']]
-    label_cols = [unit[1] for unit in label['groupBy']]
-    if pred_total == label_total == 1 \
-            and pred_cols == label_cols \
-            and pred['having'] == label['having']:
-        cnt = 1
-
-    return label_total, pred_total, cnt
-
-
-def eval_order_new(pred, label):
+def eval_order(pred, label):
     """
     Only if pred and label ordering matches completely (including asc, desc) and they both have a limit or none has
     """
@@ -377,20 +241,7 @@ def eval_order_new(pred, label):
     return label_total, pred_total, cnt
 
 
-def eval_order(pred, label):
-    pred_total = label_total = cnt = 0
-    if len(pred['orderBy']) > 0:
-        pred_total = 1
-    if len(label['orderBy']) > 0:
-        label_total = 1
-    if len(label['orderBy']) > 0 and pred['orderBy'] == label['orderBy'] and \
-            ((pred['limit'] is None and label['limit'] is None) or (
-                    pred['limit'] is not None and label['limit'] is not None)):
-        cnt = 1
-    return label_total, pred_total, cnt
-
-
-def eval_and_or_new(pred, label):
+def eval_and_or(pred, label):
     """
     True if both have 'and' or none has 'and', and the same with 'ore' respectively
     """
@@ -416,34 +267,7 @@ def eval_and_or_new(pred, label):
     return len(pred_ao), len(label_ao), 0
 
 
-def eval_and_or(pred, label):
-    pred_ao = pred['where'][1::2]
-    label_ao = label['where'][1::2]
-    pred_ao = set(pred_ao)
-    label_ao = set(label_ao)
-
-    if pred_ao == label_ao:
-        return 1, 1, 1
-    return len(pred_ao), len(label_ao), 0
-
-
-def get_nestedSQL(sql):
-    nested = []
-    for cond_unit in sql['from']['conds'][::2] + sql['where'][::2] + sql['having'][::2]:
-        if type(cond_unit[3]) is dict:
-            nested.append(cond_unit[3])
-        if type(cond_unit[4]) is dict:
-            nested.append(cond_unit[4])
-    if sql['intersect'] is not None:
-        nested.append(sql['intersect'])
-    if sql['except'] is not None:
-        nested.append(sql['except'])
-    if sql['union'] is not None:
-        nested.append(sql['union'])
-    return nested
-
-
-def eval_nested_new(pred, label):
+def eval_nested(pred, label):
     """
     Check against exact match if both are not none
     """
@@ -451,20 +275,7 @@ def eval_nested_new(pred, label):
     label_total = 1 if label is not None else 0
     cnt = 0
     if pred is not None and label is not None:
-        cnt = Evaluator().eval_exact_match_new(pred, label)
-    return label_total, pred_total, cnt
-
-
-def eval_nested(pred, label):
-    label_total = 0
-    pred_total = 0
-    cnt = 0
-    if pred is not None:
-        pred_total += 1
-    if label is not None:
-        label_total += 1
-    if pred is not None and label is not None:
-        cnt += Evaluator().eval_exact_match(pred, label)
+        cnt = Evaluator().eval_exact_match(pred, label)
     return label_total, pred_total, cnt
 
 
@@ -498,7 +309,7 @@ def get_all_no_subqueries(
     return results
 
 
-def eval_IUEN_new(pred, label):
+def eval_IUEN(pred, label):
     """
     Take right side of tree for both queries, compare this using eval_nested
     Add scores for intersect, except, union
@@ -508,16 +319,16 @@ def eval_IUEN_new(pred, label):
     pred_intersect = get_first_no_subqueries(pred, Intersect)
     label_intersect = get_first_no_subqueries(label, Intersect)
 
-    lt1, pt1, cnt1 = eval_nested_new(pred_intersect.right if pred_intersect is not None else None,
-                                     label_intersect.right if label_intersect is not None else None)
+    lt1, pt1, cnt1 = eval_nested(pred_intersect.right if pred_intersect is not None else None,
+                                 label_intersect.right if label_intersect is not None else None)
     lt += lt1
     pt += pt1
     cnt += cnt1
 
     pred_except = get_first_no_subqueries(pred, Except)
     label_except = get_first_no_subqueries(label, Except)
-    lt1, pt1, cnt1 = eval_nested_new(pred_except.right if pred_except is not None else None,
-                                     label_except.right if label_except is not None else None)
+    lt1, pt1, cnt1 = eval_nested(pred_except.right if pred_except is not None else None,
+                                 label_except.right if label_except is not None else None)
     lt += lt1
     pt += pt1
     cnt += cnt1
@@ -528,63 +339,12 @@ def eval_IUEN_new(pred, label):
     all_unions_label = [union for union in all_unions_label if union.__class__ == Union]
 
     # Check that we have found an actual union as except and intersect are also of type Union
-    lt1, pt1, cnt1 = eval_nested_new(all_unions_pred[0].right if len(all_unions_pred) > 0 else None,
-                                     all_unions_label[0].right if len(all_unions_label) > 0 else None)
+    lt1, pt1, cnt1 = eval_nested(all_unions_pred[0].right if len(all_unions_pred) > 0 else None,
+                                 all_unions_label[0].right if len(all_unions_label) > 0 else None)
     lt += lt1
     pt += pt1
     cnt += cnt1
     return lt, pt, cnt
-
-
-def eval_IUEN(pred, label):
-    lt1, pt1, cnt1 = eval_nested(pred['intersect'], label['intersect'])
-    lt2, pt2, cnt2 = eval_nested(pred['except'], label['except'])
-    lt3, pt3, cnt3 = eval_nested(pred['union'], label['union'])
-    label_total = lt1 + lt2 + lt3
-    pred_total = pt1 + pt2 + pt3
-    cnt = cnt1 + cnt2 + cnt3
-    return label_total, pred_total, cnt
-
-
-def get_keywords(sql):
-    res = set()
-    if len(sql['where']) > 0:
-        res.add('where')
-    if len(sql['groupBy']) > 0:
-        res.add('group')
-    if len(sql['having']) > 0:
-        res.add('having')
-    if len(sql['orderBy']) > 0:
-        res.add(sql['orderBy'][0])
-        res.add('order')
-    if sql['limit'] is not None:
-        res.add('limit')
-    if sql['except'] is not None:
-        res.add('except')
-    if sql['union'] is not None:
-        res.add('union')
-    if sql['intersect'] is not None:
-        res.add('intersect')
-
-    # or keyword
-    ao = sql['from']['conds'][1::2] + sql['where'][1::2] + sql['having'][1::2]
-    if len([token for token in ao if token == 'or']) > 0:
-        res.add('or')
-
-    cond_units = sql['from']['conds'][::2] + sql['where'][::2] + sql['having'][::2]
-    # not keyword
-    if len([cond_unit for cond_unit in cond_units if cond_unit[0]]) > 0:
-        res.add('not')
-
-    # in keyword
-    if len([cond_unit for cond_unit in cond_units if cond_unit[1] == WHERE_OPS.index('in')]) > 0:
-        res.add('in')
-
-    # like keyword
-    if len([cond_unit for cond_unit in cond_units if cond_unit[1] == WHERE_OPS.index('like')]) > 0:
-        res.add('like')
-
-    return res
 
 
 def dfs_left_iue(expression, prune=None):
@@ -613,7 +373,7 @@ def dfs_left_iue(expression, prune=None):
             stack.append(v)
 
 
-def get_keywords_new(expression):
+def get_keywords(expression):
     res = set()
 
     def stop_traversing(expression):
@@ -654,24 +414,11 @@ def get_keywords_new(expression):
     return res
 
 
-def eval_keywords_new(pred, label):
+def eval_keywords(pred, label):
     """
     Check if they have the same SQL keywords (in the left side of for example intersect)
     Also, does not evaluate subqueries
     """
-    pred_keywords = get_keywords_new(pred)
-    label_keywords = get_keywords_new(label)
-    pred_total = len(pred_keywords)
-    label_total = len(label_keywords)
-    cnt = 0
-
-    for k in pred_keywords:
-        if k in label_keywords:
-            cnt += 1
-    return label_total, pred_total, cnt
-
-
-def eval_keywords(pred, label):
     pred_keywords = get_keywords(pred)
     label_keywords = get_keywords(label)
     pred_total = len(pred_keywords)
@@ -684,32 +431,7 @@ def eval_keywords(pred, label):
     return label_total, pred_total, cnt
 
 
-def count_agg(units):
-    return len([unit for unit in units if has_agg(unit)])
-
-
 def count_component1(sql):
-    count = 0
-    if len(sql['where']) > 0:
-        count += 1
-    if len(sql['groupBy']) > 0:
-        count += 1
-    if len(sql['orderBy']) > 0:
-        count += 1
-    if sql['limit'] is not None:
-        count += 1
-    if len(sql['from']['table_units']) > 0:  # JOIN
-        count += len(sql['from']['table_units']) - 1
-
-    ao = sql['from']['conds'][1::2] + sql['where'][1::2] + sql['having'][1::2]
-    count += len([token for token in ao if token == 'or'])
-    cond_units = sql['from']['conds'][::2] + sql['where'][::2] + sql['having'][::2]
-    count += len([cond_unit for cond_unit in cond_units if cond_unit[1] == WHERE_OPS.index('like')])
-
-    return count
-
-
-def count_component1_new(sql):
     count = 0
     # Outermost intersect / union / except or plain select
     # The original implementation takes only the left query into account in this case (for god knows what reason)
@@ -746,11 +468,6 @@ def count_component1_new(sql):
     return count
 
 
-def count_component2(sql):
-    nested = get_nestedSQL(sql)
-    return len(nested)
-
-
 def subquery_count(expression: Expression):
     def stop_traversing(expression):
         # Stop traversing on Subqueries as sub-subqueries are not counted in the original implementation
@@ -766,7 +483,7 @@ def subquery_count(expression: Expression):
     return count
 
 
-def count_component2_new(sql):
+def count_component2(sql):
     nested_count = 0
     # Outermost intersect / union / except or plain select
     # The original implementation takes only the left query into account in this case (for god knows what reason)
@@ -789,7 +506,7 @@ def count_component2_new(sql):
     return nested_count
 
 
-def count_agg_new(expression: Expression):
+def count_agg(expression: Expression):
     def stop_traversing(expression):
         # Stop traversing on Subqueries as sub-subqueries are not counted in the original implementation
         return expression is None or expression.is_leaf() or isinstance(expression, Subquery)
@@ -800,34 +517,6 @@ def count_agg_new(expression: Expression):
     ):
         if any(isinstance(node, agg) for agg in AGG_EXPRESSIONS):
             count += 1
-
-    return count
-
-
-def count_others(sql):
-    count = 0
-    # number of aggregation
-    agg_count = count_agg(sql['select'][1])
-    agg_count += count_agg(sql['where'][::2])
-    agg_count += count_agg(sql['groupBy'])
-    if len(sql['orderBy']) > 0:
-        agg_count += count_agg([unit[1] for unit in sql['orderBy'][1] if unit[1]] +
-                               [unit[2] for unit in sql['orderBy'][1] if unit[2]])
-    agg_count += count_agg(sql['having'])
-    if agg_count > 1:
-        count += 1
-
-    # number of select columns
-    if len(sql['select'][1]) > 1:
-        count += 1
-
-    # number of where conditions
-    if len(sql['where']) > 1:
-        count += 1
-
-    # number of group by clauses
-    if len(sql['groupBy']) > 1:
-        count += 1
 
     return count
 
@@ -865,7 +554,7 @@ def count_conditions(expression: Expression):
     return count
 
 
-def count_others_new(sql):
+def count_others(sql):
     count = 0
     # only take left query into account for intersect, except, union
     select = sql
@@ -873,15 +562,15 @@ def count_others_new(sql):
         select = select.left
     agg_count = 0
     for expr in select.expressions:
-        agg_count += count_agg_new(expr)
+        agg_count += count_agg(expr)
     if select.args.get("where"):
-        agg_count += count_agg_new(select.args.get("where"))
+        agg_count += count_agg(select.args.get("where"))
     if select.args.get("group"):
-        agg_count += count_agg_new(select.args.get("group"))
+        agg_count += count_agg(select.args.get("group"))
     if select.args.get("order"):
-        agg_count += count_agg_new(select.args.get("order"))
+        agg_count += count_agg(select.args.get("order"))
     if select.args.get("having"):
-        agg_count += count_agg_new(select.args.get("having"))
+        agg_count += count_agg(select.args.get("having"))
     if agg_count > 1:
         count += 1
     column_count = len(select.expressions)
@@ -894,21 +583,6 @@ def count_others_new(sql):
         if len(select.args.get("group").expressions) > 1:
             count += 1
     return count
-
-def replace_alias(
-        expression: Expression
-):
-    """
-    Replace all table aliases in the expression with the actual table names
-    """
-    for node in expression.walk(
-            bfs=False
-    ):
-        if isinstance(node, Column):
-            if node.args["table"] is not None:
-                pass
-
-    return expression
 
 
 class Evaluator:
@@ -934,44 +608,12 @@ class Evaluator:
         else:
             return "extra"
 
-    def eval_hardness_new(self, sql):
-        count_comp1_ = count_component1_new(sql)
-        count_comp2_ = count_component2_new(sql)
-        count_others_ = count_others_new(sql)
-
-        if count_comp1_ <= 1 and count_others_ == 0 and count_comp2_ == 0:
-            return "easy"
-        elif (count_others_ <= 2 and count_comp1_ <= 1 and count_comp2_ == 0) or \
-                (count_comp1_ <= 2 and count_others_ < 2 and count_comp2_ == 0):
-            return "medium"
-        elif (count_others_ > 2 and count_comp1_ <= 2 and count_comp2_ == 0) or \
-                (2 < count_comp1_ <= 3 and count_others_ <= 2 and count_comp2_ == 0) or \
-                (count_comp1_ <= 1 and count_others_ == 0 and count_comp2_ <= 1):
-            return "hard"
-        else:
-            return "extra"
-
-    def eval_exact_match_new(self, pred, label):
-        partial_scores = self.eval_partial_match_new(pred, label)
-        self.partial_scores = partial_scores
-        for key, score in partial_scores.items():
-            if score['f1'] != 1:
-                return 0
-        # Check if they use the same tables, whyever????
-        return 1
-
     def eval_exact_match(self, pred, label):
         partial_scores = self.eval_partial_match(pred, label)
         self.partial_scores = partial_scores
-
         for key, score in partial_scores.items():
             if score['f1'] != 1:
                 return 0
-
-        if len(label['from']['table_units']) > 0:
-            label_tables = sorted(label['from']['table_units'])
-            pred_tables = sorted(pred['from']['table_units'])
-            return label_tables == pred_tables
         return 1
 
     def eval_partial_match(self, pred, label):
@@ -1015,58 +657,6 @@ class Evaluator:
         res['keywords'] = {'acc': acc, 'rec': rec, 'f1': f1, 'label_total': label_total, 'pred_total': pred_total}
 
         return res
-
-    def eval_partial_match_new(self, pred, label):
-        res = {}
-
-        label_total, pred_total, cnt, cnt_wo_agg = eval_sel_new(pred, label)
-        acc, rec, f1 = get_scores(cnt, pred_total, label_total)
-        res['select'] = {'acc': acc, 'rec': rec, 'f1': f1, 'label_total': label_total, 'pred_total': pred_total}
-        acc, rec, f1 = get_scores(cnt_wo_agg, pred_total, label_total)
-        res['select(no AGG)'] = {'acc': acc, 'rec': rec, 'f1': f1, 'label_total': label_total, 'pred_total': pred_total}
-
-        label_total, pred_total, cnt, cnt_wo_agg = eval_where_new(pred, label)
-        acc, rec, f1 = get_scores(cnt, pred_total, label_total)
-        res['where'] = {'acc': acc, 'rec': rec, 'f1': f1, 'label_total': label_total, 'pred_total': pred_total}
-        acc, rec, f1 = get_scores(cnt_wo_agg, pred_total, label_total)
-        res['where(no OP)'] = {'acc': acc, 'rec': rec, 'f1': f1, 'label_total': label_total, 'pred_total': pred_total}
-
-        label_total, pred_total, cnt = eval_group_new(pred, label)
-        acc, rec, f1 = get_scores(cnt, pred_total, label_total)
-        res['group(no Having)'] = {'acc': acc, 'rec': rec, 'f1': f1, 'label_total': label_total,
-                                   'pred_total': pred_total}
-
-        label_total, pred_total, cnt = eval_having_new(pred, label)
-        acc, rec, f1 = get_scores(cnt, pred_total, label_total)
-        res['group'] = {'acc': acc, 'rec': rec, 'f1': f1, 'label_total': label_total, 'pred_total': pred_total}
-
-        label_total, pred_total, cnt = eval_order_new(pred, label)
-        acc, rec, f1 = get_scores(cnt, pred_total, label_total)
-        res['order'] = {'acc': acc, 'rec': rec, 'f1': f1, 'label_total': label_total, 'pred_total': pred_total}
-
-        label_total, pred_total, cnt = eval_and_or_new(pred, label)
-        acc, rec, f1 = get_scores(cnt, pred_total, label_total)
-        res['and/or'] = {'acc': acc, 'rec': rec, 'f1': f1, 'label_total': label_total, 'pred_total': pred_total}
-
-        label_total, pred_total, cnt = eval_IUEN_new(pred, label)
-        acc, rec, f1 = get_scores(cnt, pred_total, label_total)
-        res['IUEN'] = {'acc': acc, 'rec': rec, 'f1': f1, 'label_total': label_total, 'pred_total': pred_total}
-
-        label_total, pred_total, cnt = eval_keywords_new(pred, label)
-        acc, rec, f1 = get_scores(cnt, pred_total, label_total)
-        res['keywords'] = {'acc': acc, 'rec': rec, 'f1': f1, 'label_total': label_total, 'pred_total': pred_total}
-
-        return res
-
-
-def isValidSQL(sql, db):
-    conn = sqlite3.connect(db)
-    cursor = conn.cursor()
-    try:
-        cursor.execute(sql)
-    except:
-        return False
-    return True
 
 
 def print_formated_s(row_name, l, element_format):
@@ -1166,7 +756,6 @@ def evaluate(gold, predict, db_dir, etype, kmaps, plug_value, keep_distinct, pro
     assert len(plist) == len(glist), "number of sessions must equal"
 
     evaluator = Evaluator()
-    evaluator_new = Evaluator()
     turns = ['turn 1', 'turn 2', 'turn 3', 'turn 4', 'turn > 4']
     levels = ['easy', 'medium', 'hard', 'extra', 'all', 'joint_all']
 
@@ -1201,11 +790,8 @@ def evaluate(gold, predict, db_dir, etype, kmaps, plug_value, keep_distinct, pro
             db_name = db
             db = os.path.join(db_dir, db, db + ".sqlite")
             schema = Schema(get_schema(db))
-            schema_new = Schema_new(get_schema_new(db))
             g_sql = get_sql(schema, g_str)
-            g_sql_new = get_sql_new(schema_new, g_str)
             hardness = evaluator.eval_hardness(g_sql)
-            hardness_new = evaluator_new.eval_hardness_new(g_sql_new)
             # print("Hardness: Old {} - New {}".format(hardness, hardness_new))
             if idx > 3:
                 idx = "> 4"
@@ -1218,28 +804,9 @@ def evaluate(gold, predict, db_dir, etype, kmaps, plug_value, keep_distinct, pro
 
             try:
                 p_sql = get_sql(schema, p_str)
-                p_sql_new = get_sql_new(schema_new, p_str)
             except:
                 # If p_sql is not valid, then we will use an empty sql to evaluate with the correct sql
-                p_sql = {
-                    "except": None,
-                    "from": {
-                        "conds": [],
-                        "table_units": []
-                    },
-                    "groupBy": [],
-                    "having": [],
-                    "intersect": None,
-                    "limit": None,
-                    "orderBy": [],
-                    "select": [
-                        False,
-                        []
-                    ],
-                    "union": None,
-                    "where": []
-                }
-                p_sql_new = Select()
+                p_sql = Select()
 
             if etype in ["all", "exec"]:
                 exec_score = eval_exec_match(db=db, p_str=p_str, g_str=g_str, plug_value=plug_value,
@@ -1256,44 +823,27 @@ def evaluate(gold, predict, db_dir, etype, kmaps, plug_value, keep_distinct, pro
             if etype in ["all", "match"]:
                 # rebuild sql for value evaluation
                 kmap = kmaps[db_name]
-                g_valid_col_units = build_valid_col_units(g_sql['from']['table_units'], schema)
-                g_sql = rebuild_sql_val(g_sql)
+                g_valid_col_units = build_valid_col_units(g_sql, schema)
+                try:
+                    g_sql = qualify(g_sql, schema=schema.to_sqlglot(), dialect='sqlite', quote_identifiers=False,
+                                    identify=False, expand_stars=False)
+                except:
+                    pass
+                g_sql = remove_val(g_sql)
                 g_sql = rebuild_sql_col(g_valid_col_units, g_sql, kmap)
-                g_valid_col_units_new = build_valid_col_units_new(g_sql_new, schema_new)
+
+                p_valid_col_units_new = build_valid_col_units(p_sql, schema)
                 try:
-                    g_sql_new = qualify(g_sql_new, schema=schema_new.to_sqlglot(), dialect='sqlite', quote_identifiers=False, identify=False, expand_stars=False)
+                    p_sql = qualify(p_sql, schema=schema.to_sqlglot(), dialect='sqlite', quote_identifiers=False,
+                                        identify=False, expand_stars=False)
                 except:
                     pass
-                # g_sql_new = replace_alias(g_sql_new)
-                g_sql_new = remove_val(g_sql_new)
-                g_sql_new = rebuild_sql_col_new(g_valid_col_units_new, g_sql_new, kmap)
 
-                p_valid_col_units = build_valid_col_units(p_sql['from']['table_units'], schema)
-                p_sql = rebuild_sql_val(p_sql)
-                p_sql = rebuild_sql_col(p_valid_col_units, p_sql, kmap)
-
-                p_valid_col_units_new = build_valid_col_units_new(p_sql_new, schema_new)
-                try:
-                    p_sql_new = qualify(p_sql_new, schema=schema_new.to_sqlglot(), dialect='sqlite', quote_identifiers=False, identify=False, expand_stars=False)
-                except:
-                    pass
-                # p_sql_new = replace_alias(p_sql_new)
-                p_sql_new = remove_val(p_sql_new)
-                p_sql_new = rebuild_sql_col_new(p_valid_col_units_new, p_sql_new, kmap)
+                p_sql = remove_val(p_sql)
+                p_sql = rebuild_sql_col(p_valid_col_units_new, p_sql, kmap)
 
                 exact_score = evaluator.eval_exact_match(p_sql, g_sql)
-                exact_score_new = evaluator_new.eval_exact_match_new(p_sql_new, g_sql_new)
-                for key in evaluator_new.partial_scores:
-                    if evaluator_new.partial_scores[key] != evaluator.partial_scores[key]:
-                        print("Mismatch in partial scores: {} - {}".format(evaluator.partial_scores[key],
-                                                                           evaluator_new.partial_scores[key]))
-                        print("Pred: {}".format(p_str))
-                        print("Gold: {}".format(g_str))
-                        print("")
-                #print("Exact Score: Old {} - New {}".format(exact_score, exact_score_new))
                 partial_scores = evaluator.partial_scores
-                partial_scores_new = evaluator_new.partial_scores
-                #print("Partial Scores: Old {} - New {}".format(partial_scores, partial_scores_new))
                 if exact_score == 0:
                     turn_scores['exact'].append(0)
                     print("{} pred: {}".format(hardness, p_str))
@@ -1444,7 +994,7 @@ def rebuild_sql_val(sql):
     return sql
 
 
-def build_valid_col_units_new(sql, schema):
+def build_valid_col_units(sql, schema):
     """
     Return all valid col units that might be used.
 
@@ -1465,17 +1015,6 @@ def build_valid_col_units_new(sql, schema):
     ]
     valid_col_units = []
     for value in schema.id_map.values():
-        if '.' in value and value[:value.index('.')] in prefixs:
-            valid_col_units.append(value)
-    return valid_col_units
-
-
-# Rebuild SQL functions for foreign key evaluation
-def build_valid_col_units(table_units, schema):
-    col_ids = [table_unit[1] for table_unit in table_units if table_unit[0] == TABLE_TYPE['table_unit']]
-    prefixs = [col_id[:-2] for col_id in col_ids]
-    valid_col_units = []
-    for value in schema.idMap.values():
         if '.' in value and value[:value.index('.')] in prefixs:
             valid_col_units.append(value)
     return valid_col_units
@@ -1572,7 +1111,7 @@ def rebuild_order_by_col(valid_col_units, order_by, kmap):
     return direction, new_val_units
 
 
-def rebuild_sql_col_new(valid_col_units, sql, kmap):
+def rebuild_sql_col(valid_col_units, sql, kmap):
     """
     Replaces foreign keys in the sql with the corresponding original names
     Ignores distinct (by turning it to None in Select) if disable_distinct is set
@@ -1612,23 +1151,6 @@ def rebuild_sql_col_new(valid_col_units, sql, kmap):
             elif column_str in valid_col_units:
                 column.this.set("this", column_str.split(".")[1].removesuffix("__"))
                 column.args["table"].set("this", column_str.split(".")[0].removeprefix("__"))
-
-    return sql
-
-
-def rebuild_sql_col(valid_col_units, sql, kmap):
-    if sql is None:
-        return sql
-
-    sql['select'] = rebuild_select_col(valid_col_units, sql['select'], kmap)
-    sql['from'] = rebuild_from_col(valid_col_units, sql['from'], kmap)
-    sql['where'] = rebuild_condition_col(valid_col_units, sql['where'], kmap)
-    sql['groupBy'] = rebuild_group_by_col(valid_col_units, sql['groupBy'], kmap)
-    sql['orderBy'] = rebuild_order_by_col(valid_col_units, sql['orderBy'], kmap)
-    sql['having'] = rebuild_condition_col(valid_col_units, sql['having'], kmap)
-    sql['intersect'] = rebuild_sql_col(valid_col_units, sql['intersect'], kmap)
-    sql['except'] = rebuild_sql_col(valid_col_units, sql['except'], kmap)
-    sql['union'] = rebuild_sql_col(valid_col_units, sql['union'], kmap)
 
     return sql
 
