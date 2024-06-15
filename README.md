@@ -153,3 +153,22 @@ This led to a few rather questionable implementation decisions
 - We only count subqueries, not sub-subqueries for the nested query count to align with the original implementation
 - In case of an outer intersect, union or except we only measure the complexity of the individual components of the first query, not the complexity of the whole query
 - We only check outer SQL for the component complexity, not subqueries
+
+The aggregation count in the original implementation does not work correctly on aggregations in the where or having part of a query.
+We fixed this, leading to 21 differences in the count on dev gold.
+
+In total, we classified 21 samples from dev gold in a different hardness class as the original implementation.
+- Lines 86,87 were classified as hard instead of extra
+- Line 428 was classified as hard instead of extra
+- Line 504 was classified as hard instead of extra
+- Line 698 was classified as hard instead of extra
+- Lines 745,746 were classified as hard instead of easy
+- Lines 765-768 were classified as hard instead of extra
+- Lines 793,794 were classified as extra instead of medium
+- Lines 917,918 were classified as hard instead of extra
+- Lines 979-984 were classified as hard instead of extra
+
+Regarding the actual scores, we yield the same scores as the original implementation on the dev gold file.
+There are two lines that yield different label total and pred total values of the dev gold file than in the original implementation.
+Please note that only the label total and pred total values are different, the scores (i.e. everything that's printed) are the same.
+The lines are l. 927 and l. 928. The issue arises from the fact that the original implementation parses union, except and intersect from left to right rather than as a proper tree.

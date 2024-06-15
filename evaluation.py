@@ -23,11 +23,17 @@ import os
 import json
 import sqlite3
 import argparse
-
-from process_sql_new import get_schema, Schema, get_sql
+import tqdm
+from process_sql import get_schema, Schema, get_sql
+from process_sql_new import get_schema as get_schema_new
+from process_sql_new import Schema as Schema_new
+from process_sql_new import get_sql as get_sql_new
 from exec_eval import eval_exec_match
 from sqlglot.expressions import Intersect, Except, Union, Subquery, Expression, Count, Max, Min, Sum, Avg, Column, \
-    Condition
+    Condition, And, Or, Identifier, Literal, Distinct, Alias, Not, Between, EQ, GT, LT, GTE, LTE, NEQ, In, Like, Is, \
+    Exists, Limit, Order, Having, Group, Where, Ordered, Join, Select
+from sqlglot.optimizer.scope import build_scope, walk_in_scope
+from sqlglot.optimizer.qualify import qualify
 
 # Flag to disable value evaluation
 DISABLE_VALUE = True
@@ -40,6 +46,7 @@ CLAUSE_KEYWORDS = ('select', 'from', 'where', 'group', 'order', 'limit', 'inters
 JOIN_KEYWORDS = ('join', 'on', 'as')
 
 WHERE_OPS = ('not', 'between', '=', '>', '<', '>=', '<=', '!=', 'in', 'like', 'is', 'exists')
+WHERE_EXPR = (Not, Between, EQ, GT, LT, GTE, LTE, NEQ, In, Like, Is, Exists)
 UNIT_OPS = ('none', '-', '+', "*", '/')
 AGG_OPS = ('none', 'max', 'min', 'count', 'sum', 'avg')
 TABLE_TYPE = {
@@ -48,7 +55,9 @@ TABLE_TYPE = {
 }
 
 COND_OPS = ('and', 'or')
+COND_EXPR = (And, Or)
 SQL_OPS = ('intersect', 'union', 'except')
+SQL_EXPR = (Intersect, Union, Except)
 ORDER_OPS = ('desc', 'asc')
 
 HARDNESS = {
@@ -109,6 +118,45 @@ def get_scores(count, pred_total, label_total):
     return 0, 0, 0
 
 
+def remove_agg(expr):
+    """
+    Remove top level aggregation from expression if present
+    """
+    # Instead of alias, use the actual expression
+    expr = expr.unalias()
+    # Remove outermost aggregation
+    if isinstance(expr, AGG_EXPRESSIONS):
+        expr = expr.this
+    return expr
+
+
+def eval_sel_new(pred, label):
+    """
+    Compare select statements of the two (i.e. expressions)
+    Also check the same but ignore aggregations this time, i.e. it's okay if aggregations have been forgotten
+    """
+    while any(isinstance(pred, expr) for expr in SQL_EXPR):
+        pred = pred.left
+    while any(isinstance(label, expr) for expr in SQL_EXPR):
+        label = label.left
+
+    cnt = 0
+    cnt_wo_agg = 0
+    pred_total = len(pred.expressions)
+    label_total = len(label.expressions)
+    label_expressions = [expr.copy().unalias() for expr in label.expressions]
+    expressions_with_agg_removed = [remove_agg(expr) for expr in label.expressions]
+
+    for expr in pred.expressions:
+        if expr.unalias() in label_expressions:
+            cnt += 1
+            label_expressions.remove(expr.unalias())
+        if remove_agg(expr) in expressions_with_agg_removed:
+            cnt_wo_agg += 1
+            expressions_with_agg_removed.remove(remove_agg(expr))
+    return label_total, pred_total, cnt, cnt_wo_agg
+
+
 def eval_sel(pred, label):
     pred_sel = pred['select'][1]
     label_sel = label['select'][1]
@@ -125,6 +173,69 @@ def eval_sel(pred, label):
         if unit[1] in label_wo_agg:
             cnt_wo_agg += 1
             label_wo_agg.remove(unit[1])
+
+    return label_total, pred_total, cnt, cnt_wo_agg
+
+
+def get_conditions(expression: Expression):
+    def stop_traversing(expression):
+        # Stop traversing on Subqueries as sub-subqueries are not counted in the original implementation
+        return expression is None or expression.is_leaf() or isinstance(expression, Subquery) or (isinstance(expression,
+                                                                                                             Condition) and not any(
+            isinstance(expression, expr) for expr in COND_EXPR))
+
+    conditions = []
+    for node in expression.walk(
+            bfs=False, prune=stop_traversing
+    ):
+        # Do not count conjunctions
+        if isinstance(node, Condition) and not any(isinstance(node, expr) for expr in COND_EXPR):
+            conditions.append(node)
+
+    return conditions
+
+
+def remove_where_agg(expression: Expression):
+    """
+    Remove top level aggregation from expression if present
+    """
+
+    if isinstance(expression, WHERE_EXPR):
+        return expression.this
+    return expression
+
+
+def eval_where_new(pred, label):
+    """
+        Compare conditions of the where part of the two (i.e. expressions)
+        Also check the same but ignore aggregations this time, i.e. it's okay if aggregations have been forgotten
+    """
+    while any(isinstance(pred, expr) for expr in SQL_EXPR):
+        pred = pred.left
+    while any(isinstance(label, expr) for expr in SQL_EXPR):
+        label = label.left
+
+    if pred.args.get("where") is None:
+        pred_conds = []
+    else:
+        pred_conds = get_conditions(pred.args.get("where"))
+    if label.args.get("where") is None:
+        label_conds = []
+    else:
+        label_conds = get_conditions(label.args.get("where"))
+    pred_total = len(pred_conds)
+    label_total = len(label_conds)
+    label_wo_agg = [remove_where_agg(cond) for cond in label_conds]
+    cnt = 0
+    cnt_wo_agg = 0
+
+    for unit in pred_conds:
+        if unit in label_conds:
+            cnt += 1
+            label_conds.remove(unit)
+        if remove_where_agg(unit) in label_wo_agg:
+            cnt_wo_agg += 1
+            label_wo_agg.remove(remove_where_agg(unit))
 
     return label_total, pred_total, cnt, cnt_wo_agg
 
@@ -149,6 +260,36 @@ def eval_where(pred, label):
     return label_total, pred_total, cnt, cnt_wo_agg
 
 
+def eval_group_new(pred, label):
+    """
+    Compare columns of group statement (with stripped table prefix)
+    """
+    while any(isinstance(pred, expr) for expr in SQL_EXPR):
+        pred = pred.left
+    while any(isinstance(label, expr) for expr in SQL_EXPR):
+        label = label.left
+
+    if pred.args.get("group") is None:
+        pred_cols = []
+    else:
+        pred_cols = pred.args.get("group").expressions
+    if label.args.get("group") is None:
+        label_cols = []
+    else:
+        label_cols = label.args.get("group").expressions
+
+    pred_total = len(pred_cols)
+    label_total = len(label_cols)
+    cnt = 0
+    pred_cols = [col.name for col in pred_cols]
+    label_cols = [col.name for col in label_cols]
+    for col in pred_cols:
+        if col in label_cols:
+            cnt += 1
+            label_cols.remove(col)
+    return label_total, pred_total, cnt
+
+
 def eval_group(pred, label):
     pred_cols = [unit[1] for unit in pred['groupBy']]
     label_cols = [unit[1] for unit in label['groupBy']]
@@ -161,6 +302,27 @@ def eval_group(pred, label):
         if col in label_cols:
             cnt += 1
             label_cols.remove(col)
+    return label_total, pred_total, cnt
+
+
+def eval_having_new(pred, label):
+    """
+    Uses the group by columns. Only if group by is equal (including order, unlike whats done in the eval_group)
+    and the having sections are IDENTICAL (other than the removed values before), return 1
+    """
+    while any(isinstance(pred, expr) for expr in SQL_EXPR):
+        pred = pred.left
+    while any(isinstance(label, expr) for expr in SQL_EXPR):
+        label = label.left
+    pred_total = 1 if pred.args.get("group") is not None else 0
+    label_total = 1 if label.args.get("group") is not None else 0
+    cnt = 0
+    pred_cols = [col.name for col in pred.args.get("group").expressions] if pred.args.get("group") is not None else []
+    label_cols = [col.name for col in label.args.get("group").expressions] if label.args.get(
+        "group") is not None else []
+    if pred_total == label_total == 1 and pred_cols == label_cols and pred.args.get("having") == label.args.get(
+            "having"):
+        cnt = 1
     return label_total, pred_total, cnt
 
 
@@ -181,6 +343,40 @@ def eval_having(pred, label):
     return label_total, pred_total, cnt
 
 
+def eval_order_new(pred, label):
+    """
+    Only if pred and label ordering matches completely (including asc, desc) and they both have a limit or none has
+    """
+    while any(isinstance(pred, expr) for expr in SQL_EXPR):
+        pred = pred.left
+    while any(isinstance(label, expr) for expr in SQL_EXPR):
+        label = label.left
+    pred_total = 1 if pred.args.get("order") is not None else 0
+    label_total = 1 if label.args.get("order") is not None else 0
+    cnt = 0
+    # Replace alias with actual expression to compare easily
+    pred = pred.copy()
+    label = label.copy()
+    pred_order = pred.args.get("order").copy() if pred.args.get("order") is not None else None
+    if pred_order:
+        for identifier in pred_order.find_all(Identifier):
+            for expr in pred.expressions:
+                if expr.alias_or_name == identifier.this:
+                    identifier.parent.replace(expr.unalias())
+    label_order = label.args.get("order").copy() if label.args.get("order") is not None else None
+    if label_order:
+        for identifier in label_order.find_all(Identifier):
+            for expr in label.expressions:
+                if expr.alias_or_name == identifier.this:
+                    identifier.parent.replace(expr.unalias())
+
+    if pred_total == label_total == 1 and pred_order == label_order and \
+            ((pred.args.get("limit") is None and label.args.get("limit") is None) or (
+                    pred.args.get("limit") is not None and label.args.get("limit") is not None)):
+        cnt = 1
+    return label_total, pred_total, cnt
+
+
 def eval_order(pred, label):
     pred_total = label_total = cnt = 0
     if len(pred['orderBy']) > 0:
@@ -192,6 +388,32 @@ def eval_order(pred, label):
                     pred['limit'] is not None and label['limit'] is not None)):
         cnt = 1
     return label_total, pred_total, cnt
+
+
+def eval_and_or_new(pred, label):
+    """
+    True if both have 'and' or none has 'and', and the same with 'ore' respectively
+    """
+    while any(isinstance(pred, expr) for expr in SQL_EXPR):
+        pred = pred.left
+    while any(isinstance(label, expr) for expr in SQL_EXPR):
+        label = label.left
+
+    pred_ao = set()
+    label_ao = set()
+    if pred.args.get("where") is not None:
+        if get_first_no_subqueries(pred.args.get("where"), And) is not None:
+            pred_ao.add('and')
+        if get_first_no_subqueries(pred.args.get("where"), Or) is not None:
+            pred_ao.add('or')
+    if label.args.get("where") is not None:
+        if get_first_no_subqueries(label.args.get("where"), And) is not None:
+            label_ao.add('and')
+        if get_first_no_subqueries(label.args.get("where"), Or) is not None:
+            label_ao.add('or')
+    if pred_ao == label_ao:
+        return 1, 1, 1
+    return len(pred_ao), len(label_ao), 0
 
 
 def eval_and_or(pred, label):
@@ -221,6 +443,18 @@ def get_nestedSQL(sql):
     return nested
 
 
+def eval_nested_new(pred, label):
+    """
+    Check against exact match if both are not none
+    """
+    pred_total = 1 if pred is not None else 0
+    label_total = 1 if label is not None else 0
+    cnt = 0
+    if pred is not None and label is not None:
+        cnt = Evaluator().eval_exact_match_new(pred, label)
+    return label_total, pred_total, cnt
+
+
 def eval_nested(pred, label):
     label_total = 0
     pred_total = 0
@@ -232,6 +466,74 @@ def eval_nested(pred, label):
     if pred is not None and label is not None:
         cnt += Evaluator().eval_exact_match(pred, label)
     return label_total, pred_total, cnt
+
+
+def get_first_no_subqueries(
+        expression: Expression, class_to_find: type
+):
+    def stop_traversing(expression):
+        # Stop traversing on Subqueries as sub-subqueries are not counted in the original implementation
+        return expression is None or expression.is_leaf() or isinstance(expression, Subquery)
+
+    for node in expression.walk(
+            bfs=False, prune=stop_traversing
+    ):
+        if isinstance(node, class_to_find):
+            return node
+
+
+def get_all_no_subqueries(
+        expression: Expression, class_to_find: type
+):
+    def stop_traversing(expression):
+        # Stop traversing on Subqueries as sub-subqueries are not counted in the original implementation
+        return expression is None or expression.is_leaf() or isinstance(expression, Subquery)
+
+    results = []
+    for node in expression.walk(
+            bfs=False, prune=stop_traversing
+    ):
+        if isinstance(node, class_to_find):
+            results.append(node)
+    return results
+
+
+def eval_IUEN_new(pred, label):
+    """
+    Take right side of tree for both queries, compare this using eval_nested
+    Add scores for intersect, except, union
+    """
+
+    lt, pt, cnt = 0, 0, 0
+    pred_intersect = get_first_no_subqueries(pred, Intersect)
+    label_intersect = get_first_no_subqueries(label, Intersect)
+
+    lt1, pt1, cnt1 = eval_nested_new(pred_intersect.right if pred_intersect is not None else None,
+                                     label_intersect.right if label_intersect is not None else None)
+    lt += lt1
+    pt += pt1
+    cnt += cnt1
+
+    pred_except = get_first_no_subqueries(pred, Except)
+    label_except = get_first_no_subqueries(label, Except)
+    lt1, pt1, cnt1 = eval_nested_new(pred_except.right if pred_except is not None else None,
+                                     label_except.right if label_except is not None else None)
+    lt += lt1
+    pt += pt1
+    cnt += cnt1
+
+    all_unions_pred = get_all_no_subqueries(pred, Union)
+    all_unions_label = get_all_no_subqueries(label, Union)
+    all_unions_pred = [union for union in all_unions_pred if union.__class__ == Union]
+    all_unions_label = [union for union in all_unions_label if union.__class__ == Union]
+
+    # Check that we have found an actual union as except and intersect are also of type Union
+    lt1, pt1, cnt1 = eval_nested_new(all_unions_pred[0].right if len(all_unions_pred) > 0 else None,
+                                     all_unions_label[0].right if len(all_unions_label) > 0 else None)
+    lt += lt1
+    pt += pt1
+    cnt += cnt1
+    return lt, pt, cnt
 
 
 def eval_IUEN(pred, label):
@@ -285,6 +587,90 @@ def get_keywords(sql):
     return res
 
 
+def dfs_left_iue(expression, prune=None):
+    """
+    Returns a generator object which visits all nodes in this tree in
+    the DFS (Depth-first) order.
+
+    Returns:
+        The generator object.
+    """
+    stack = [expression]
+
+    while stack:
+        node = stack.pop()
+
+        yield node
+
+        if prune and prune(node):
+            continue
+
+        if any(isinstance(node, expr) for expr in SQL_EXPR):
+            stack.append(node.left)
+            continue
+
+        for v in node.iter_expressions(reverse=True):
+            stack.append(v)
+
+
+def get_keywords_new(expression):
+    res = set()
+
+    def stop_traversing(expression):
+        # Stop traversing on Subqueries as sub-subqueries are not counted in the original implementation
+        return expression is None or expression.is_leaf() or isinstance(expression, Subquery)
+
+    for node in dfs_left_iue(expression, stop_traversing):
+        if isinstance(node, Intersect):
+            res.add('intersect')
+        if isinstance(node, Except):
+            res.add('except')
+        if isinstance(node, Union) and node.__class__ == Union:
+            res.add('union')
+        if isinstance(node, Limit):
+            res.add('limit')
+        if isinstance(node, Order):
+            res.add('order')
+        if isinstance(node, Ordered):
+            if node.args["desc"]:
+                res.add('desc')
+            else:
+                res.add('asc')
+        if isinstance(node, Having):
+            res.add('having')
+        if isinstance(node, Group):
+            res.add('group')
+        if isinstance(node, Where):
+            res.add('where')
+        # We have to exclude joins here as the original implementation does not consider or in join conditions
+        if isinstance(node, Or) and not isinstance(node.parent, Join):
+            res.add('or')
+        if isinstance(node, Not):
+            res.add('not')
+        if isinstance(node, In):
+            res.add('in')
+        if isinstance(node, Like):
+            res.add('like')
+    return res
+
+
+def eval_keywords_new(pred, label):
+    """
+    Check if they have the same SQL keywords (in the left side of for example intersect)
+    Also, does not evaluate subqueries
+    """
+    pred_keywords = get_keywords_new(pred)
+    label_keywords = get_keywords_new(label)
+    pred_total = len(pred_keywords)
+    label_total = len(label_keywords)
+    cnt = 0
+
+    for k in pred_keywords:
+        if k in label_keywords:
+            cnt += 1
+    return label_total, pred_total, cnt
+
+
 def eval_keywords(pred, label):
     pred_keywords = get_keywords(pred)
     label_keywords = get_keywords(label)
@@ -323,14 +709,13 @@ def count_component1(sql):
     return count
 
 
-def count_component1(sql):
+def count_component1_new(sql):
     count = 0
     # Outermost intersect / union / except or plain select
     # The original implementation takes only the left query into account in this case (for god knows what reason)
-    if isinstance(sql, Intersect) or isinstance(sql, Except) or isinstance(sql, Union):
-        select = sql.left
-    else:
-        select = sql
+    select = sql
+    while any(isinstance(select, expr) for expr in SQL_EXPR):
+        select = select.left
     # Only check outer components, not nested SQL (similar to original implementation)
 
     if select.args.get("where") is not None:
@@ -381,15 +766,13 @@ def subquery_count(expression: Expression):
     return count
 
 
-def count_component2(sql):
+def count_component2_new(sql):
     nested_count = 0
     # Outermost intersect / union / except or plain select
     # The original implementation takes only the left query into account in this case (for god knows what reason)
-    if isinstance(sql, Intersect) or isinstance(sql, Except) or isinstance(sql, Union):
-        nested_count += 1
-        select = sql.left
-    else:
-        select = sql
+    select = sql
+    while any(isinstance(select, expr) for expr in SQL_EXPR):
+        select = select.left
     if select.args.get("from"):
         from_clause = select.args.get("from")
         nested_count += subquery_count(from_clause)
@@ -406,9 +789,7 @@ def count_component2(sql):
     return nested_count
 
 
-
-
-def count_agg(expression: Expression):
+def count_agg_new(expression: Expression):
     def stop_traversing(expression):
         # Stop traversing on Subqueries as sub-subqueries are not counted in the original implementation
         return expression is None or expression.is_leaf() or isinstance(expression, Subquery)
@@ -469,40 +850,41 @@ def count_columns(expression: Expression):
 def count_conditions(expression: Expression):
     def stop_traversing(expression):
         # Stop traversing on Subqueries as sub-subqueries are not counted in the original implementation
-        return expression is None or expression.is_leaf() or isinstance(expression, Subquery) or isinstance(expression,
-                                                                                                            Condition)
+        return expression is None or expression.is_leaf() or isinstance(expression, Subquery) or (isinstance(expression,
+                                                                                                             Condition) and not any(
+            isinstance(expression, expr) for expr in COND_EXPR))
 
     count = 0
     for node in expression.walk(
             bfs=False, prune=stop_traversing
     ):
-        if isinstance(node, Condition):
+        # Do not count conjunctions
+        if isinstance(node, Condition) and not any(isinstance(node, expr) for expr in COND_EXPR):
             count += 1
 
     return count
 
 
-def count_others(sql):
+def count_others_new(sql):
     count = 0
     # only take left query into account for intersect, except, union
-    if isinstance(sql, Intersect) or isinstance(sql, Except) or isinstance(sql, Union):
-        select = sql.left
-    else:
-        select = sql
-    agg_count = count_agg(select)
+    select = sql
+    while any(isinstance(select, expr) for expr in SQL_EXPR):
+        select = select.left
+    agg_count = 0
+    for expr in select.expressions:
+        agg_count += count_agg_new(expr)
     if select.args.get("where"):
-        agg_count += count_agg(select.args.get("where"))
+        agg_count += count_agg_new(select.args.get("where"))
     if select.args.get("group"):
-        agg_count += count_agg(select.args.get("group"))
+        agg_count += count_agg_new(select.args.get("group"))
     if select.args.get("order"):
-        agg_count += count_agg(select.args.get("order"))
+        agg_count += count_agg_new(select.args.get("order"))
     if select.args.get("having"):
-        agg_count += count_agg(select.args.get("having"))
+        agg_count += count_agg_new(select.args.get("having"))
     if agg_count > 1:
         count += 1
     column_count = len(select.expressions)
-    # for expr in select.expressions:
-    #     column_count += count_columns(expr)
     if column_count > 1:
         count += 1
     if select.args.get("where"):
@@ -512,6 +894,21 @@ def count_others(sql):
         if len(select.args.get("group").expressions) > 1:
             count += 1
     return count
+
+def replace_alias(
+        expression: Expression
+):
+    """
+    Replace all table aliases in the expression with the actual table names
+    """
+    for node in expression.walk(
+            bfs=False
+    ):
+        if isinstance(node, Column):
+            if node.args["table"] is not None:
+                pass
+
+    return expression
 
 
 class Evaluator:
@@ -536,6 +933,32 @@ class Evaluator:
             return "hard"
         else:
             return "extra"
+
+    def eval_hardness_new(self, sql):
+        count_comp1_ = count_component1_new(sql)
+        count_comp2_ = count_component2_new(sql)
+        count_others_ = count_others_new(sql)
+
+        if count_comp1_ <= 1 and count_others_ == 0 and count_comp2_ == 0:
+            return "easy"
+        elif (count_others_ <= 2 and count_comp1_ <= 1 and count_comp2_ == 0) or \
+                (count_comp1_ <= 2 and count_others_ < 2 and count_comp2_ == 0):
+            return "medium"
+        elif (count_others_ > 2 and count_comp1_ <= 2 and count_comp2_ == 0) or \
+                (2 < count_comp1_ <= 3 and count_others_ <= 2 and count_comp2_ == 0) or \
+                (count_comp1_ <= 1 and count_others_ == 0 and count_comp2_ <= 1):
+            return "hard"
+        else:
+            return "extra"
+
+    def eval_exact_match_new(self, pred, label):
+        partial_scores = self.eval_partial_match_new(pred, label)
+        self.partial_scores = partial_scores
+        for key, score in partial_scores.items():
+            if score['f1'] != 1:
+                return 0
+        # Check if they use the same tables, whyever????
+        return 1
 
     def eval_exact_match(self, pred, label):
         partial_scores = self.eval_partial_match(pred, label)
@@ -588,6 +1011,48 @@ class Evaluator:
         res['IUEN'] = {'acc': acc, 'rec': rec, 'f1': f1, 'label_total': label_total, 'pred_total': pred_total}
 
         label_total, pred_total, cnt = eval_keywords(pred, label)
+        acc, rec, f1 = get_scores(cnt, pred_total, label_total)
+        res['keywords'] = {'acc': acc, 'rec': rec, 'f1': f1, 'label_total': label_total, 'pred_total': pred_total}
+
+        return res
+
+    def eval_partial_match_new(self, pred, label):
+        res = {}
+
+        label_total, pred_total, cnt, cnt_wo_agg = eval_sel_new(pred, label)
+        acc, rec, f1 = get_scores(cnt, pred_total, label_total)
+        res['select'] = {'acc': acc, 'rec': rec, 'f1': f1, 'label_total': label_total, 'pred_total': pred_total}
+        acc, rec, f1 = get_scores(cnt_wo_agg, pred_total, label_total)
+        res['select(no AGG)'] = {'acc': acc, 'rec': rec, 'f1': f1, 'label_total': label_total, 'pred_total': pred_total}
+
+        label_total, pred_total, cnt, cnt_wo_agg = eval_where_new(pred, label)
+        acc, rec, f1 = get_scores(cnt, pred_total, label_total)
+        res['where'] = {'acc': acc, 'rec': rec, 'f1': f1, 'label_total': label_total, 'pred_total': pred_total}
+        acc, rec, f1 = get_scores(cnt_wo_agg, pred_total, label_total)
+        res['where(no OP)'] = {'acc': acc, 'rec': rec, 'f1': f1, 'label_total': label_total, 'pred_total': pred_total}
+
+        label_total, pred_total, cnt = eval_group_new(pred, label)
+        acc, rec, f1 = get_scores(cnt, pred_total, label_total)
+        res['group(no Having)'] = {'acc': acc, 'rec': rec, 'f1': f1, 'label_total': label_total,
+                                   'pred_total': pred_total}
+
+        label_total, pred_total, cnt = eval_having_new(pred, label)
+        acc, rec, f1 = get_scores(cnt, pred_total, label_total)
+        res['group'] = {'acc': acc, 'rec': rec, 'f1': f1, 'label_total': label_total, 'pred_total': pred_total}
+
+        label_total, pred_total, cnt = eval_order_new(pred, label)
+        acc, rec, f1 = get_scores(cnt, pred_total, label_total)
+        res['order'] = {'acc': acc, 'rec': rec, 'f1': f1, 'label_total': label_total, 'pred_total': pred_total}
+
+        label_total, pred_total, cnt = eval_and_or_new(pred, label)
+        acc, rec, f1 = get_scores(cnt, pred_total, label_total)
+        res['and/or'] = {'acc': acc, 'rec': rec, 'f1': f1, 'label_total': label_total, 'pred_total': pred_total}
+
+        label_total, pred_total, cnt = eval_IUEN_new(pred, label)
+        acc, rec, f1 = get_scores(cnt, pred_total, label_total)
+        res['IUEN'] = {'acc': acc, 'rec': rec, 'f1': f1, 'label_total': label_total, 'pred_total': pred_total}
+
+        label_total, pred_total, cnt = eval_keywords_new(pred, label)
         acc, rec, f1 = get_scores(cnt, pred_total, label_total)
         res['keywords'] = {'acc': acc, 'rec': rec, 'f1': f1, 'label_total': label_total, 'pred_total': pred_total}
 
@@ -701,6 +1166,7 @@ def evaluate(gold, predict, db_dir, etype, kmaps, plug_value, keep_distinct, pro
     assert len(plist) == len(glist), "number of sessions must equal"
 
     evaluator = Evaluator()
+    evaluator_new = Evaluator()
     turns = ['turn 1', 'turn 2', 'turn 3', 'turn 4', 'turn > 4']
     levels = ['easy', 'medium', 'hard', 'extra', 'all', 'joint_all']
 
@@ -724,16 +1190,23 @@ def evaluate(gold, predict, db_dir, etype, kmaps, plug_value, keep_distinct, pro
             print('Evaluating %dth prediction' % (i + 1))
         scores['joint_all']['count'] += 1
         turn_scores = {"exec": [], "exact": []}
-        for idx, pg in enumerate(zip(p, g)):
+        for idx, pg in enumerate(tqdm.tqdm(zip(p, g))):
             p, g = pg
             p_str = p[0]
             p_str = p_str.replace("value", "1")
             g_str, db = g
+            # SQL uses single quotes, but some datasets use double quotes
+            g_str = g_str.replace("\"", "'")
+            p_str = p_str.replace("\"", "'")
             db_name = db
             db = os.path.join(db_dir, db, db + ".sqlite")
             schema = Schema(get_schema(db))
+            schema_new = Schema_new(get_schema_new(db))
             g_sql = get_sql(schema, g_str)
+            g_sql_new = get_sql_new(schema_new, g_str)
             hardness = evaluator.eval_hardness(g_sql)
+            hardness_new = evaluator_new.eval_hardness_new(g_sql_new)
+            # print("Hardness: Old {} - New {}".format(hardness, hardness_new))
             if idx > 3:
                 idx = "> 4"
             else:
@@ -745,6 +1218,7 @@ def evaluate(gold, predict, db_dir, etype, kmaps, plug_value, keep_distinct, pro
 
             try:
                 p_sql = get_sql(schema, p_str)
+                p_sql_new = get_sql_new(schema_new, p_str)
             except:
                 # If p_sql is not valid, then we will use an empty sql to evaluate with the correct sql
                 p_sql = {
@@ -765,6 +1239,7 @@ def evaluate(gold, predict, db_dir, etype, kmaps, plug_value, keep_distinct, pro
                     "union": None,
                     "where": []
                 }
+                p_sql_new = Select()
 
             if etype in ["all", "exec"]:
                 exec_score = eval_exec_match(db=db, p_str=p_str, g_str=g_str, plug_value=plug_value,
@@ -784,11 +1259,41 @@ def evaluate(gold, predict, db_dir, etype, kmaps, plug_value, keep_distinct, pro
                 g_valid_col_units = build_valid_col_units(g_sql['from']['table_units'], schema)
                 g_sql = rebuild_sql_val(g_sql)
                 g_sql = rebuild_sql_col(g_valid_col_units, g_sql, kmap)
+                g_valid_col_units_new = build_valid_col_units_new(g_sql_new, schema_new)
+                try:
+                    g_sql_new = qualify(g_sql_new, schema=schema_new.to_sqlglot(), dialect='sqlite', quote_identifiers=False, identify=False, expand_stars=False)
+                except:
+                    pass
+                # g_sql_new = replace_alias(g_sql_new)
+                g_sql_new = remove_val(g_sql_new)
+                g_sql_new = rebuild_sql_col_new(g_valid_col_units_new, g_sql_new, kmap)
+
                 p_valid_col_units = build_valid_col_units(p_sql['from']['table_units'], schema)
                 p_sql = rebuild_sql_val(p_sql)
                 p_sql = rebuild_sql_col(p_valid_col_units, p_sql, kmap)
+
+                p_valid_col_units_new = build_valid_col_units_new(p_sql_new, schema_new)
+                try:
+                    p_sql_new = qualify(p_sql_new, schema=schema_new.to_sqlglot(), dialect='sqlite', quote_identifiers=False, identify=False, expand_stars=False)
+                except:
+                    pass
+                # p_sql_new = replace_alias(p_sql_new)
+                p_sql_new = remove_val(p_sql_new)
+                p_sql_new = rebuild_sql_col_new(p_valid_col_units_new, p_sql_new, kmap)
+
                 exact_score = evaluator.eval_exact_match(p_sql, g_sql)
+                exact_score_new = evaluator_new.eval_exact_match_new(p_sql_new, g_sql_new)
+                for key in evaluator_new.partial_scores:
+                    if evaluator_new.partial_scores[key] != evaluator.partial_scores[key]:
+                        print("Mismatch in partial scores: {} - {}".format(evaluator.partial_scores[key],
+                                                                           evaluator_new.partial_scores[key]))
+                        print("Pred: {}".format(p_str))
+                        print("Gold: {}".format(g_str))
+                        print("")
+                #print("Exact Score: Old {} - New {}".format(exact_score, exact_score_new))
                 partial_scores = evaluator.partial_scores
+                partial_scores_new = evaluator_new.partial_scores
+                #print("Partial Scores: Old {} - New {}".format(partial_scores, partial_scores_new))
                 if exact_score == 0:
                     turn_scores['exact'].append(0)
                     print("{} pred: {}".format(hardness, p_str))
@@ -885,6 +1390,11 @@ def rebuild_cond_unit_val(cond_unit):
     return not_op, op_id, val_unit, val1, val2
 
 
+# def rebuild_condition_val(sql):
+#     for condition:
+#         res.append(rebuild_cond_unit_val(condition))
+#     return res
+
 def rebuild_condition_val(condition):
     if condition is None or not DISABLE_VALUE:
         return condition
@@ -896,6 +1406,28 @@ def rebuild_condition_val(condition):
         else:
             res.append(it)
     return res
+
+
+def remove_val(expression):
+    """
+    Removes values from conditions, does so in the left and right of an intersect for example. Does nothing else. Misleading name.
+    """
+
+    def transform(node):
+        if isinstance(node, Literal):
+            return None
+        return node
+
+    expression = expression.transform(transform)
+    return expression
+    # count = 0
+    # for node in expression.walk(
+    #         bfs=False, prune=stop_traversing
+    # ):
+    #     if isinstance(node, Subquery):
+    #         count += 1
+    #
+    # return count
 
 
 def rebuild_sql_val(sql):
@@ -910,6 +1442,32 @@ def rebuild_sql_val(sql):
     sql['union'] = rebuild_sql_val(sql['union'])
 
     return sql
+
+
+def build_valid_col_units_new(sql, schema):
+    """
+    Return all valid col units that might be used.
+
+    :param sql: Parsed SQL as a tree
+    """
+    select = sql
+    while any(isinstance(select, expr) for expr in SQL_EXPR):
+        select = select.left
+    if not select.args.get("from"):
+        return []
+    from_expr = select.args["from"]
+    tables = [from_expr.name]
+    join_expr = select.args["joins"] if "joins" in select.args else []
+    for join in join_expr:
+        tables.append(join.this.name)
+    prefixs = [
+        f"__{table.lower()}" for table in tables
+    ]
+    valid_col_units = []
+    for value in schema.id_map.values():
+        if '.' in value and value[:value.index('.')] in prefixs:
+            valid_col_units.append(value)
+    return valid_col_units
 
 
 # Rebuild SQL functions for foreign key evaluation
@@ -984,6 +1542,10 @@ def rebuild_select_col(valid_col_units, sel, kmap):
     return distinct, new_list
 
 
+# def rebuild_from_col(sql, kmap):
+#     # Replaces foreign keys with corresponding column in original table, sets distinct to none if disable distinct
+
+
 def rebuild_from_col(valid_col_units, from_, kmap):
     if from_ is None:
         return from_
@@ -1008,6 +1570,50 @@ def rebuild_order_by_col(valid_col_units, order_by, kmap):
     direction, val_units = order_by
     new_val_units = [rebuild_val_unit_col(valid_col_units, val_unit, kmap) for val_unit in val_units]
     return direction, new_val_units
+
+
+def rebuild_sql_col_new(valid_col_units, sql, kmap):
+    """
+    Replaces foreign keys in the sql with the corresponding original names
+    Ignores distinct (by turning it to None in Select) if disable_distinct is set
+    """
+    # Drop distinct nodes
+    if sql is None:
+        return sql
+
+    def ignore_distinct(node):
+        if isinstance(node, Distinct) and not isinstance(node.parent, Count):
+            return None
+        # Treat count distinct as count
+        elif isinstance(node, Distinct) and isinstance(node.parent, Count):
+            node.parent.set("expressions", node.expressions)
+            return None
+        return node
+
+    if DISABLE_DISTINCT:
+        sql = sql.transform(ignore_distinct)
+
+    # Get columns
+    root = build_scope(sql)
+    for scope in root.traverse():
+        alias_to_table = scope.selected_sources
+        for column in scope.find_all(Column):
+            # Kmap-Format
+            # If table is not in alias_to_table, we can not replace the column
+            if not column.table in alias_to_table:
+                continue
+            column_str = f"__{alias_to_table[column.table][0].name}." + column.name.lower() + "__"
+            if column_str in valid_col_units and column_str in kmap:
+                # Update column identifier + table accordingly
+                new_column_str = kmap[column_str]
+                column.this.set("this", new_column_str.split(".")[1].removesuffix("__"))
+                column.args["table"].set("this", new_column_str.split(".")[0].removeprefix("__"))
+            # Replace alias with original table name
+            elif column_str in valid_col_units:
+                column.this.set("this", column_str.split(".")[1].removesuffix("__"))
+                column.args["table"].set("this", column_str.split(".")[0].removeprefix("__"))
+
+    return sql
 
 
 def rebuild_sql_col(valid_col_units, sql, kmap):
@@ -1076,52 +1682,52 @@ def build_foreign_key_map_from_json(table):
     return tables
 
 
-# if __name__ == "__main__":
-#     parser = argparse.ArgumentParser()
-#     parser.add_argument('--gold', dest='gold', type=str, help="the path to the gold queries")
-#     parser.add_argument('--pred', dest='pred', type=str, help="the path to the predicted queries")
-#     parser.add_argument('--db', dest='db', type=str,
-#                         help="the directory that contains all the databases and test suites")
-#     parser.add_argument('--table', dest='table', type=str, help="the tables.json schema file")
-#     parser.add_argument('--etype', dest='etype', type=str, default='exec',
-#                         help="evaluation type, exec for test suite accuracy, match for the original exact set match accuracy",
-#                         choices=('all', 'exec', 'match'))
-#     parser.add_argument('--plug_value', default=False, action='store_true',
-#                         help='whether to plug in the gold value into the predicted query; suitable if your model does not predict values.')
-#     parser.add_argument('--keep_distinct', default=False, action='store_true',
-#                         help='whether to keep distinct keyword during evaluation. default is false.')
-#     parser.add_argument('--progress_bar_for_each_datapoint', default=False, action='store_true',
-#                         help='whether to print progress bar of running test inputs for each datapoint')
-#     args = parser.parse_args()
-#
-#     # only evaluting exact match needs this argument
-#     kmaps = None
-#     if args.etype in ['all', 'match']:
-#         assert args.table is not None, 'table argument must be non-None if exact set match is evaluated'
-#         kmaps = build_foreign_key_map_from_json(args.table)
-#
-#     evaluate(args.gold, args.pred, args.db, args.etype, kmaps, args.plug_value, args.keep_distinct,
-#              args.progress_bar_for_each_datapoint)
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--gold', dest='gold', type=str, help="the path to the gold queries")
+    parser.add_argument('--pred', dest='pred', type=str, help="the path to the predicted queries")
+    parser.add_argument('--db', dest='db', type=str,
+                        help="the directory that contains all the databases and test suites")
+    parser.add_argument('--table', dest='table', type=str, help="the tables.json schema file")
+    parser.add_argument('--etype', dest='etype', type=str, default='exec',
+                        help="evaluation type, exec for test suite accuracy, match for the original exact set match accuracy",
+                        choices=('all', 'exec', 'match'))
+    parser.add_argument('--plug_value', default=False, action='store_true',
+                        help='whether to plug in the gold value into the predicted query; suitable if your model does not predict values.')
+    parser.add_argument('--keep_distinct', default=False, action='store_true',
+                        help='whether to keep distinct keyword during evaluation. default is false.')
+    parser.add_argument('--progress_bar_for_each_datapoint', default=False, action='store_true',
+                        help='whether to print progress bar of running test inputs for each datapoint')
+    args = parser.parse_args()
 
+    # only evaluting exact match needs this argument
+    kmaps = None
+    if args.etype in ['all', 'match']:
+        assert args.table is not None, 'table argument must be non-None if exact set match is evaluated'
+        kmaps = build_foreign_key_map_from_json(args.table)
 
-db_dir = "./spider/spider/database"
-with open("/home/simon/PycharmProjects/test-suite-sql-eval/dev_gold.sql", "r") as f:
-    gold = f.readlines()
-gold_tuples = []
-counts = []
-for i in range(len(gold)):
-    gold[i] = gold[i].strip()
-    gold_tuples.append(gold[i].split('\t'))
-idx = 0
-for g, db_name in gold_tuples:
-    if idx == 10:
-        print(idx)
-        print(g)
-    db = os.path.join(db_dir, db_name, db_name + ".sqlite")
-    schema = Schema(get_schema(db))
-    g_sql = get_sql(schema, g)
-    counts.append(count_others(g_sql))
-    idx += 1
-with open("new_countsother.txt", "w") as f:
-    for c in counts:
-        f.write(str(c) + "\n")
+    evaluate(args.gold, args.pred, args.db, args.etype, kmaps, args.plug_value, args.keep_distinct,
+             args.progress_bar_for_each_datapoint)
+#
+# db_dir = "./database"
+# with open("/home/simon/PycharmProjects/test-suite-sql-eval/dev_gold.sql", "r") as f:
+#     gold = f.readlines()
+# gold_tuples = []
+# counts = []
+# for i in range(len(gold)):
+#     gold[i] = gold[i].strip()
+#     gold_tuples.append(gold[i].split('\t'))
+# idx = 0
+# for g, db_name in gold_tuples:
+#     if idx == 161:
+#         print(idx)
+#         print(g)
+#     db = os.path.join(db_dir, db_name, db_name + ".sqlite")
+#     schema = Schema(get_schema(db))
+#     g_sql = get_sql(schema, g)
+#     #evaluator = Evaluator()
+#     #counts.append(evaluator.eval_hardness(g_sql))
+#     idx += 1
+# with open("old_countsother.txt", "w") as f:
+#     for c in counts:
+#         f.write(str(c) + "\n")

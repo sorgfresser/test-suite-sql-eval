@@ -97,6 +97,16 @@ class Schema:
 
         return id_map
 
+    def to_sqlglot(self):
+        tables = {}
+        for table in self._schema.classes:
+            col_dict = {
+            }
+            for col in table.__table__.columns:
+                col_dict[col.name] = col.type
+            tables[table.__table__.name] = col_dict
+        return tables
+
 
 def scan_alias(toks):
     """Scan the index of 'as' and build the map for all alias"""
