@@ -1230,26 +1230,3 @@ if __name__ == "__main__":
 
     evaluate(args.gold, args.pred, args.db, args.etype, kmaps, args.plug_value, args.keep_distinct,
              args.progress_bar_for_each_datapoint)
-#
-# db_dir = "./database"
-# with open("/home/simon/PycharmProjects/test-suite-sql-eval/dev_gold.sql", "r") as f:
-#     gold = f.readlines()
-# gold_tuples = []
-# counts = []
-# for i in range(len(gold)):
-#     gold[i] = gold[i].strip()
-#     gold_tuples.append(gold[i].split('\t'))
-# idx = 0
-# for g, db_name in gold_tuples:
-#     if idx == 161:
-#         print(idx)
-#         print(g)
-#     db = os.path.join(db_dir, db_name, db_name + ".sqlite")
-#     schema = Schema(get_schema(db))
-#     g_sql = get_sql(schema, g)
-#     #evaluator = Evaluator()
-#     #counts.append(evaluator.eval_hardness(g_sql))
-#     idx += 1
-# with open("old_countsother.txt", "w") as f:
-#     for c in counts:
-#         f.write(str(c) + "\n")
